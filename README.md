@@ -1,4 +1,4 @@
-# JSA — Cost of Carry Calculator
+# JSA — Cost of Carry & Seasonal Spreads
 
 Streamlit app that prices CBOT and MGEX grain futures spreads against the full financial
 cost of carry (storage + interest), replicating the JSA *Cost of Carry Sheet* workbook with
