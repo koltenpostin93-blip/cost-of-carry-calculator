@@ -13,9 +13,8 @@ from massive_api import (MassiveApiError, get_fed_funds_rate, get_futures_curve,
 HERE = Path(__file__).parent
 
 # Swap LOGO_FILE to the 50-year anniversary asset once it's dropped into assets/.
-LOGO_FILE = "logo-full.png"
+LOGO_FILE = "logo-50yr.png"
 FAVICON_FILE = "jsa_favicon.png"
-# Drop the 50-year anniversary PNG in as assets/logo-50yr.png and it is picked up here.
 WATERMARK_FILE = "logo-50yr.png"
 WATERMARK_OPACITY = 0.10
 
