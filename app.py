@@ -112,9 +112,11 @@ COMMODITIES = [
 
 HISTORY_LOOKBACK_DAYS = 365
 
-# Full-carry convention from the reference workbook: fed funds + 2.5%.
-FED_FUNDS_SPREAD_PCT = 2.5
-FALLBACK_ANNUAL_RATE_PCT = 6.14
+# Full-carry convention: fed funds + 2.25%.
+FED_FUNDS_SPREAD_PCT = 2.25
+# Static safety net for when the live ZQ read fails. The workbook's 6.14% assumed a
+# 2.5% spread, so it is rebased here to keep the fallback on the same convention.
+FALLBACK_ANNUAL_RATE_PCT = 5.89
 
 MONTH_LETTERS = {
     "F": "Jan", "G": "Feb", "H": "Mar", "J": "Apr", "K": "May", "M": "Jun",
@@ -804,7 +806,7 @@ def summary_section(commodity: dict, api_key: str, as_of: date, annual_rate_pct:
             f"<div style='font-size:0.82rem;line-height:1.7;padding-top:6px;'>"
             f"Daily Storage Rate&nbsp;&nbsp;<b>{storage_rate:.5f}</b><br>"
             f"Annual Interest Rate&nbsp;&nbsp;<b>{annual_rate_pct:.2f}%</b><br>"
-            f"<span style='color:#6b7280;'>(Fed Funds + {FED_FUNDS_SPREAD_PCT:.1f}%)</span>"
+            f"<span style='color:#6b7280;'>(Fed Funds + {FED_FUNDS_SPREAD_PCT:.2f}%)</span>"
             f"</div>",
             unsafe_allow_html=True,
         )
