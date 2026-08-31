@@ -873,10 +873,7 @@ def render_summary(api_key: str, as_of: date, default_rate_pct: float):
 
 MATRIX_METRICS = ["Market Carry", "Cost of Carry", "% Full Carry"]
 MATRIX_META = ["Symbol", "Month", "Price", ""]
-POS_STYLE = "color:#0b8043;font-weight:600;"
-NEG_STYLE = "color:#c5221f;font-weight:600;"
-GROUP_TOP = "border-top:2px solid #b8c4ce;"
-METRIC_BAND = "background-color:#f3f6f9;"
+GROUP_TOP = "border-top:2px solid #8FCB8F;"
 
 
 def tick_price(price: float, multiplier: int) -> str:
@@ -981,20 +978,26 @@ def render_matrix(api_key: str, as_of: date, default_rate_pct: float):
     def style_row(row: pd.Series):
         source = frame.iloc[row.name]
         metric = source[""]
-        base = GROUP_TOP if metric == "Market Carry" else ""
-        if metric == "Cost of Carry":
-            base += METRIC_BAND
+        # same banding as the summary and per-market tables: a green header row
+        # carrying the contract, a light band under it, and the shared carry buckets
+        if metric == "Market Carry":
+            base = GROUP_TOP + GROUP_BAND
+        elif metric == "Cost of Carry":
+            base = GROUP_HEADER
+        else:
+            base = GROUP_BAND
         out = []
         for col in row.index:
             value = source[col] if col in labels else None
             if value is None or pd.isna(value) or metric != "% Full Carry":
                 out.append(base)
             else:
-                out.append(base + (POS_STYLE if value >= 0 else NEG_STYLE))
+                out.append(base + BUCKET_STYLE[carry_bucket(value)])
         return out
 
     styler = display.style.apply(style_row, axis=1)
 
+    render_legend()
     with st.container(key="tablewrap_matrix"):
         st.dataframe(styler, hide_index=True, width="stretch",
                      height=min(35 * (len(display) + 1) + 3, 900))
