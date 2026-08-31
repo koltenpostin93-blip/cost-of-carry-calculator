@@ -842,8 +842,10 @@ def summary_section(commodity: dict, api_key: str, as_of: date, annual_rate_pct:
         }, na_rep="—")
     )
     with right:
-        st.dataframe(styler, hide_index=True, width="stretch",
-                     height=min(35 * (len(display) + 1) + 3, 900))
+        # keyed container so the shared tablewrap_ watermark CSS attaches here too
+        with st.container(key=f"tablewrap_sum_{commodity['key']}"):
+            st.dataframe(styler, hide_index=True, width="stretch",
+                         height=min(35 * (len(display) + 1) + 3, 900))
     export_row(display, f"cost_of_carry_{commodity['key']}", key=f"sum_{commodity['key']}")
 
 
