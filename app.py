@@ -928,6 +928,213 @@ def build_matrix(curve: pd.DataFrame, code: str, storage_rate: float,
     return pd.DataFrame(rows), labels
 
 
+# ── Soybean board crush ───────────────────────────────────────────────────────
+# One 60 lb bushel yields roughly 44 lb meal and 11 lb oil:
+#   meal  $/ton  x 44/2000 = x 0.022
+#   oil   c/lb   x 11 / 100 = x 0.11   (cents -> dollars)
+#   beans c/bu   / 100                 (cents -> dollars)
+# Massive lists no tradeable crush product — its SOM "ZM:ZL:ZS Soy Crush" combo
+# returns no prices — so the margin is built from the three legs.
+CRUSH_CODE = "CS"
+CRUSH_MEAL_FACTOR = 44 / 2000
+CRUSH_OIL_FACTOR = 11 / 100
+# Soybeans trade F H K N Q U X; meal and oil trade F H K N Q U V Z. Same letter
+# where both exist, and the November bean pairs with December product — the
+# standard November crush.
+CRUSH_MONTH_MAP = {"F": "F", "H": "H", "K": "K", "N": "N", "Q": "Q", "U": "U", "X": "Z"}
+
+
+def crush_value(bean_cents: float, meal_usd: float, oil_cents: float) -> float:
+    """Board crush in $/bu."""
+    return CRUSH_MEAL_FACTOR * meal_usd + CRUSH_OIL_FACTOR * oil_cents - bean_cents / 100
+
+
+def crush_legs(bean_ticker: str) -> tuple[str, str] | None:
+    """ZSX6 -> (ZMZ6, ZLZ6). None when the bean month has no product counterpart."""
+    suffix = bean_ticker[2:]
+    if len(suffix) != 2:
+        return None
+    product_month = CRUSH_MONTH_MAP.get(suffix[0])
+    if not product_month:
+        return None
+    return f"ZM{product_month}{suffix[1]}", f"ZL{product_month}{suffix[1]}"
+
+
+@st.cache_data(ttl="5m", show_spinner=False)
+def load_crush_curve(api_key: str, as_of: str, n_contracts: int) -> pd.DataFrame:
+    """Crush margin per bean contract month, with each leg's price alongside."""
+    beans = load_curve("ZS", api_key, as_of, n_contracts)
+    meal = load_curve("ZM", api_key, as_of, n_contracts + 4).set_index("ticker")
+    oil = load_curve("ZL", api_key, as_of, n_contracts + 4).set_index("ticker")
+
+    rows = []
+    for bean in beans.itertuples(index=False):
+        legs = crush_legs(bean.ticker)
+        if not legs:
+            continue
+        meal_t, oil_t = legs
+        if meal_t not in meal.index or oil_t not in oil.index:
+            continue
+        meal_price = float(meal.loc[meal_t, "price"])
+        oil_price = float(oil.loc[oil_t, "price"])
+        rows.append({
+            "ticker": f"{CRUSH_CODE}{bean.ticker[2:]}",
+            "expiration": bean.expiration,
+            "price": crush_value(bean.price, meal_price, oil_price),
+            "Beans": bean.ticker, "Bean price": bean.price,
+            "Meal": meal_t, "Meal price": meal_price,
+            "Oil": oil_t, "Oil price": oil_price,
+        })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl="6h", show_spinner="Loading crush history…")
+def load_crush_history(bean_tickers: tuple[str, ...], api_key: str, as_of: str) -> dict[str, pd.Series]:
+    """Crush margin history keyed by synthetic CS ticker, on sessions where all
+    three legs settled."""
+    wanted: list[str] = []
+    mapping: dict[str, tuple[str, str, str]] = {}
+    for bean in bean_tickers:
+        legs = crush_legs(bean)
+        if not legs:
+            continue
+        meal_t, oil_t = legs
+        mapping[f"{CRUSH_CODE}{bean[2:]}"] = (bean, meal_t, oil_t)
+        wanted += [bean, meal_t, oil_t]
+
+    raw = get_settlement_histories(sorted(set(wanted)), api_key)
+    out: dict[str, pd.Series] = {}
+    for label, (bean, meal_t, oil_t) in mapping.items():
+        b, m, o = raw.get(bean), raw.get(meal_t), raw.get(oil_t)
+        if b is None or m is None or o is None or not len(b) or not len(m) or not len(o):
+            continue
+        frame = pd.DataFrame({"b": b, "m": m, "o": o}).dropna()
+        if frame.empty:
+            continue
+        out[label] = (CRUSH_MEAL_FACTOR * frame["m"]
+                      + CRUSH_OIL_FACTOR * frame["o"]
+                      - frame["b"] / 100)
+    return out
+
+
+def render_crush(api_key: str, as_of: date):
+    st.markdown("##### Soybean crush")
+    st.caption(
+        r"Board crush margin per bushel: **0.022 × meal (\$/ton) + 0.11 × oil (¢/lb) − beans (\$/bu)**, "
+        "on the assumption of 44 lb of meal and 11 lb of oil from a 60 lb bushel. The November bean "
+        "is paired with December meal and oil, the standard November crush. Massive lists no tradeable "
+        "crush contract, so this is built from the three legs rather than quoted off the board."
+    )
+
+    controls = st.container(horizontal=True, vertical_alignment="bottom")
+    with controls:
+        n_contracts = st.slider("Contract months", 3, 10, 6, key="crush_months", width=210)
+        range_label = st.segmented_control("Range", list(RANGE_CHOICES), default="1Y", key="crush_range")
+        years_back = st.slider("Prior crop years", 0, SEASONAL_YEARS_BACK, 3,
+                               key="crush_years", width=190)
+
+    try:
+        curve = load_crush_curve(api_key, as_of.isoformat(), n_contracts)
+    except MassiveApiError as e:
+        st.error(f"Couldn't build the crush curve: {e}")
+        return
+    if curve.empty:
+        st.warning("No crush months could be built — a leg is missing from the live curve.")
+        return
+
+    window_days = RANGE_CHOICES.get(range_label or "1Y", 365)
+
+    with st.container(horizontal=True):
+        front = curve.iloc[0]
+        best = curve.loc[curve["price"].idxmax()]
+        st.metric("Front crush", friendly_contract(front["ticker"], CRUSH_CODE),
+                  f"${front['price']:.3f}/bu", delta_color="off", border=True)
+        st.metric("Widest crush on the board", f"${best['price']:.3f}/bu",
+                  friendly_contract(best["ticker"], CRUSH_CODE), delta_color="off", border=True)
+        st.metric("Board spread, front to back",
+                  f"{curve['price'].max() - curve['price'].min():.3f}",
+                  f"{len(curve)} months", delta_color="off", border=True)
+
+    display = pd.DataFrame({
+        "Crush": [friendly_contract(t, CRUSH_CODE) for t in curve["ticker"]],
+        "Crush $/bu": curve["price"],
+        "Beans": curve["Beans"], "Beans ¢/bu": curve["Bean price"],
+        "Meal": curve["Meal"], "Meal $/ton": curve["Meal price"],
+        "Oil": curve["Oil"], "Oil ¢/lb": curve["Oil price"],
+    })
+    styler = display.style.format({
+        "Crush $/bu": "{:.3f}", "Beans ¢/bu": "{:.2f}",
+        "Meal $/ton": "{:.2f}", "Oil ¢/lb": "{:.2f}",
+    }).apply(lambda r: [GROUP_BAND if r.name % 2 == 0 else ""] * len(r), axis=1)
+    with st.container(key="tablewrap_crush"):
+        st.dataframe(styler, hide_index=True, width="stretch",
+                     height=min(38 * (len(display) + 1) + 3, 480))
+    export_row(display, "soybean_crush_curve", key="crush_curve")
+
+    # ── history & seasonality for one crush month ────────────────────────────
+    pick = st.selectbox("Crush month", list(curve["ticker"]), key="crush_pick", width=190,
+                        format_func=lambda t: friendly_contract(t, CRUSH_CODE))
+    bean_for = dict(zip(curve["ticker"], curve["Beans"]))
+    anchor_expiry = dict(zip(curve["ticker"], curve["expiration"]))[pick]
+
+    bean_tickers = [bean_for[pick]]
+    for back in range(1, years_back + 1):
+        older = shift_ticker_year(bean_for[pick], "ZS", -back)
+        if older:
+            bean_tickers.append(older)
+    hist = load_crush_history(tuple(bean_tickers), api_key, as_of.isoformat())
+
+    left, right = st.columns(2)
+    with left:
+        st.caption(f"**{friendly_contract(pick, CRUSH_CODE)} crush** — history")
+        series = hist.get(pick)
+        if series is None or not len(series):
+            st.info("No overlapping settlement history across the three legs.")
+        else:
+            shown = series[series.index >= as_of - timedelta(days=window_days)] if window_days else series
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=list(shown.index), y=list(shown.values), mode="lines",
+                                     line=dict(color=SEASONAL_COLORS[0], width=2), name="crush",
+                                     hovertemplate="%{x|%b %d, %Y}<br>$%{y:.3f}<extra></extra>"))
+            _style_axes(fig, "Crush ($/bu)", None, ".2f")
+            fig.update_layout(showlegend=False)
+            st.plotly_chart(fig, width="stretch", key="crush_hist",
+                            config=plotly_config("soybean_crush_history"))
+            st.caption(f"{len(shown):,} sessions · {shown.index.min():%b %d, %Y} → {shown.index.max():%b %d, %Y}")
+
+    with right:
+        st.caption(f"**{friendly_contract(pick, CRUSH_CODE)} crush** — seasonal")
+        fig = go.Figure()
+        drawn = 0
+        for back, bean in enumerate(bean_tickers):
+            label = f"{CRUSH_CODE}{bean[2:]}"
+            s = hist.get(label)
+            if s is None or not len(s):
+                continue
+            expiry = s.index.max() if back else anchor_expiry
+            dte = [-(expiry - d).days for d in s.index]
+            keep = [i for i, d in enumerate(dte) if window_days is None or d >= -window_days]
+            if not keep:
+                continue
+            fig.add_trace(go.Scatter(
+                x=[anchor_expiry + timedelta(days=dte[i]) for i in keep],
+                y=[s.values[i] for i in keep], mode="lines",
+                name=label + (" (current)" if back == 0 else ""),
+                line=dict(color=SEASONAL_COLORS[back % len(SEASONAL_COLORS)],
+                          width=3 if back == 0 else 1.5),
+                opacity=1.0 if back == 0 else 0.75,
+                hovertemplate=f"{label}<br>$%{{y:.3f}}<extra></extra>"))
+            drawn += 1
+        if not drawn:
+            st.info("No prior-year crush history available.")
+        else:
+            _style_axes(fig, "Crush ($/bu)", None, ".2f")
+            fig.update_xaxes(tickformat="%b", dtick="M1")
+            st.plotly_chart(fig, width="stretch", key="crush_seasonal",
+                            config=plotly_config("soybean_crush_seasonal"))
+            st.caption(f"{drawn} crop year{'s' if drawn != 1 else ''} overlaid, aligned on the bean leg's expiration.")
+
+
 def render_matrix(api_key: str, as_of: date, default_rate_pct: float):
     st.markdown("##### Spread matrix")
     st.caption(
@@ -1273,7 +1480,7 @@ hence the sign flip in the denominator.
 """
         )
 
-    tabs = st.tabs(["Summary", "Spread Builder", "Spread Matrix"]
+    tabs = st.tabs(["Summary", "Spread Builder", "Spread Matrix", "Crush"]
                    + [c["label"] for c in COMMODITIES])
     with tabs[0]:
         render_summary(api_key, as_of, default_rate_pct)
@@ -1281,7 +1488,9 @@ hence the sign flip in the denominator.
         render_builder(api_key, as_of, default_rate_pct)
     with tabs[2]:
         render_matrix(api_key, as_of, default_rate_pct)
-    for tab, commodity in zip(tabs[3:], COMMODITIES):
+    with tabs[3]:
+        render_crush(api_key, as_of)
+    for tab, commodity in zip(tabs[4:], COMMODITIES):
         with tab:
             render_commodity(commodity, api_key, as_of, default_rate_pct)
 
