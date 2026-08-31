@@ -1,0 +1,1153 @@
+import base64
+import os
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from massive_api import (MassiveApiError, get_fed_funds_rate, get_futures_curve,
+                         get_settlement_histories)
+
+HERE = Path(__file__).parent
+
+# Swap LOGO_FILE to the 50-year anniversary asset once it's dropped into assets/.
+LOGO_FILE = "logo-full.png"
+FAVICON_FILE = "jsa_favicon.png"
+# Drop the 50-year anniversary PNG in as assets/logo-50yr.png and it is picked up here.
+WATERMARK_FILE = "logo-50yr.png"
+WATERMARK_OPACITY = 0.10
+
+
+def asset(name: str) -> str:
+    return str(HERE / "assets" / name)
+
+
+def watermark_path() -> str | None:
+    """Prefer the 50-year mark; fall back to the standard logo until it's dropped in."""
+    for name in (WATERMARK_FILE, LOGO_FILE):
+        candidate = asset(name)
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def watermark_uri(path: str) -> str:
+    """Logo as a base64 data URI — Plotly layout images can't read local paths."""
+    return "data:image/png;base64," + base64.b64encode(Path(path).read_bytes()).decode()
+
+
+st.set_page_config(
+    page_title="JSA - Cost of Carry Calculator",
+    page_icon=asset(FAVICON_FILE),
+    layout="wide",
+)
+
+COMMODITIES = [
+    {
+        "key": "corn",
+        "label": "Corn",
+        "sublabel": "CBOT · ZC",
+        "product_code": "ZC",
+        "default_storage": 0.00265,
+        "storage_unit": "cents/bu/day",
+        "multiplier": 100,
+    },
+    {
+        "key": "soybeans",
+        "label": "Soybeans",
+        "sublabel": "CBOT · ZS",
+        "product_code": "ZS",
+        "default_storage": 0.00265,
+        "storage_unit": "cents/bu/day",
+        "multiplier": 100,
+    },
+    {
+        "key": "soymeal",
+        "label": "Soybean meal",
+        "sublabel": "CBOT · ZM",
+        "product_code": "ZM",
+        "default_storage": 0.12,
+        "storage_unit": "$/ton/day",
+        "multiplier": 1,
+    },
+    {
+        "key": "soyoil",
+        "label": "Soybean oil",
+        "sublabel": "CBOT · ZL",
+        "product_code": "ZL",
+        "default_storage": 0.005,
+        "storage_unit": "cents/lb/day",
+        "multiplier": 1,
+    },
+    {
+        "key": "chi_wheat",
+        "label": "Chicago wheat (SRW)",
+        "sublabel": "CBOT · ZW",
+        "product_code": "ZW",
+        "default_storage": 0.00265,
+        "storage_unit": "cents/bu/day",
+        "multiplier": 100,
+    },
+    {
+        "key": "kc_wheat",
+        "label": "KC wheat (HRW)",
+        "sublabel": "CBOT · KE",
+        "product_code": "KE",
+        "default_storage": 0.00165,
+        "storage_unit": "cents/bu/day",
+        "multiplier": 100,
+    },
+    {
+        "key": "spring_wheat",
+        "label": "Spring wheat (HRS)",
+        "sublabel": "MGEX · HRS",
+        "product_code": "HRS",
+        "default_storage": 0.002667,
+        "storage_unit": "cents/bu/day",
+        "multiplier": 100,
+    },
+]
+
+HISTORY_LOOKBACK_DAYS = 365
+
+# Full-carry convention from the reference workbook: fed funds + 2.5%.
+FED_FUNDS_SPREAD_PCT = 2.5
+FALLBACK_ANNUAL_RATE_PCT = 6.14
+
+MONTH_LETTERS = {
+    "F": "Jan", "G": "Feb", "H": "Mar", "J": "Apr", "K": "May", "M": "Jun",
+    "N": "Jul", "Q": "Aug", "U": "Sep", "V": "Oct", "X": "Nov", "Z": "Dec",
+}
+
+
+def get_api_key() -> str:
+    try:
+        key = st.secrets.get("MASSIVE_API_KEY", "")
+    except Exception:
+        key = ""
+    return key or os.environ.get("MASSIVE_API_KEY", "")
+
+
+def friendly_contract(ticker: str, product_code: str) -> str:
+    suffix = ticker[len(product_code):]
+    if len(suffix) == 2 and suffix[0] in MONTH_LETTERS:
+        return f"{MONTH_LETTERS[suffix[0]]} '2{suffix[1]}"
+    return ticker
+
+
+@st.cache_data(ttl="5m", show_spinner=False)
+def load_curve(product_code: str, api_key: str, as_of: str, n_contracts: int) -> pd.DataFrame:
+    return get_futures_curve(product_code, api_key, date.fromisoformat(as_of), n_contracts=n_contracts)
+
+
+@st.cache_data(ttl="6h", show_spinner="Loading spread history…")
+def load_history(tickers: tuple[str, ...], api_key: str, as_of: str) -> dict[str, pd.Series]:
+    """Settlement history for a whole curve. Cached hard — daily bars change once a day."""
+    return get_settlement_histories(list(tickers), api_key)
+
+
+@st.cache_data(ttl="1h", show_spinner=False)
+def load_fed_funds(api_key: str, as_of: str) -> dict:
+    """Front-month ZQ implied fed funds rate. Cached — it moves in basis points."""
+    return get_fed_funds_rate(api_key, date.fromisoformat(as_of))
+
+
+def carry_bucket(pct: float) -> str:
+    if pct >= 0.75:
+        return "high"
+    if pct >= 0.50:
+        return "mid"
+    return "low"
+
+
+BUCKET_STYLE = {
+    "high": "background-color:#C6EFCE;color:#006100;",
+    "mid": "background-color:#FFEB9C;color:#9C5700;",
+    "low": "background-color:#FFC7CE;color:#9C0006;",
+}
+
+GROUP_BAND = "background-color:#EAF7EA;"
+GROUP_HEADER = "background-color:#CDEFCD;font-weight:600;border-top:1px solid #8FCB8F;"
+
+
+def compute_carry_table(curve: pd.DataFrame, daily_storage_rate: float, annual_rate: float, multiplier: int,
+                        history: dict[str, pd.Series] | None = None,
+                        history_start: date | None = None) -> pd.DataFrame:
+    """Full spread matrix: every near contract against every later (deferred) contract."""
+    history = history or {}
+    rows = []
+    for i in range(len(curve)):
+        near = curve.iloc[i]
+        for j in range(i + 1, len(curve)):
+            far = curve.iloc[j]
+            days = (far["expiration"] - near["expiration"]).days
+            if days <= 0:
+                continue
+            spread = near["price"] - far["price"]
+            storage_full = days * daily_storage_rate * multiplier
+            interest_full = near["price"] * annual_rate * days / 360
+            full_carry = storage_full + interest_full
+            if not full_carry or not storage_full or not interest_full:
+                continue
+            # historical range of this spread, over sessions where both legs traded
+            near_hist = history.get(near["ticker"])
+            far_hist = history.get(far["ticker"])
+            low = high = low_date = high_date = sessions = None
+            if near_hist is not None and far_hist is not None and len(near_hist) and len(far_hist):
+                spread_hist = (near_hist - far_hist).dropna()
+                if history_start is not None:
+                    spread_hist = spread_hist[spread_hist.index >= history_start]
+                if len(spread_hist):
+                    sessions = len(spread_hist)
+                    low, high = spread_hist.min(), spread_hist.max()
+                    low_date, high_date = spread_hist.idxmin(), spread_hist.idxmax()
+
+            rows.append(
+                {
+                    "near_idx": i,
+                    "Near": near["ticker"],
+                    "Far": far["ticker"],
+                    "Near price": near["price"],
+                    "Current": spread,
+                    "Low": low,
+                    "Low date": low_date,
+                    "High": high,
+                    "High date": high_date,
+                    "Sessions": sessions,
+                    "Full storage": storage_full,
+                    "% full storage": spread / -storage_full,
+                    "Monthly interest": interest_full / (days / 30),
+                    "Full interest": interest_full,
+                    "% full interest": -spread / interest_full,
+                    "Full carry": full_carry,
+                    "% full carry": spread / -full_carry,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+FULL_CARRY_COLUMNS = ["Full storage", "Full interest", "Full carry"]
+
+
+def table_watermark_css() -> str:
+    """The dataframe grid paints its cells on an opaque canvas, so a background image
+    behind it never shows. The mark is overlaid instead, with pointer-events:none so
+    sorting, scrolling and the toolbar still work."""
+    wm = watermark_path()
+    if not wm:
+        return ""
+    return f"""<style>
+[class*="st-key-tablewrap_"] {{ position: relative; }}
+[class*="st-key-tablewrap_"]::after {{
+  content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 5;
+  background-image: url('{watermark_uri(wm)}');
+  background-repeat: no-repeat; background-position: center center;
+  background-size: min(34%, 260px);
+  opacity: {WATERMARK_OPACITY};
+}}
+</style>"""
+
+
+def plotly_config(filename: str) -> dict:
+    """One-click PNG straight from the chart toolbar. Client-side, so it costs nothing
+    to render and works on Streamlit Cloud where kaleido is fragile."""
+    return {
+        "displayModeBar": True,
+        "displaylogo": False,
+        "toImageButtonOptions": {"format": "png", "filename": filename,
+                                 "height": 700, "width": 1400, "scale": 2},
+    }
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def figure_png(fig_json: str) -> bytes | None:
+    """Server-side PNG for the explicit download button. Cached on the figure itself so
+    a rerun that doesn't change the chart doesn't pay for it twice."""
+    try:
+        import plotly.io as pio
+        return pio.from_json(fig_json).to_image(format="png", width=1400, height=700, scale=2)
+    except Exception:
+        return None
+
+
+def export_row(frame: pd.DataFrame, filename: str, key: str, fig=None):
+    """Copy-to-clipboard + CSV, plus PNG when a figure is supplied.
+
+    PNG bytes are only rendered once the user asks, because to_image() costs about a
+    second per chart and this app draws a lot of charts."""
+    row = st.container(horizontal=True, vertical_alignment="center")
+    with row:
+        # st.code carries a native copy-to-clipboard control. A hand-rolled
+        # <button onclick=...> cannot work here: contract labels contain apostrophes
+        # ("Sep '26") which close the attribute, and Streamlit strips inline handlers.
+        tsv = frame.to_csv(sep="	", index=False)
+        with st.popover("Copy", width=90):
+            st.caption("Tab-separated — use the copy icon, then paste into Excel.")
+            st.code(tsv, language=None, height=260)
+        st.download_button("CSV", frame.to_csv(index=False).encode(), f"{filename}.csv",
+                           "text/csv", key=f"csv_{key}", width=90)
+        if fig is not None:
+            if st.button("PNG", key=f"png_btn_{key}", width=90,
+                         help="Render this chart as a PNG for download."):
+                st.session_state[f"png_ready_{key}"] = True
+            if st.session_state.get(f"png_ready_{key}"):
+                data = figure_png(fig.to_json())
+                if data:
+                    st.download_button("Save PNG", data, f"{filename}.png", "image/png",
+                                       key=f"png_dl_{key}", width=120)
+                else:
+                    st.caption("PNG export unavailable — use the camera icon on the chart.")
+
+
+def render_legend():
+    chips = "".join(
+        f'<span style="{BUCKET_STYLE[b]}padding:2px 10px;border-radius:4px;font-size:0.82rem;'
+        f'white-space:nowrap;">{txt}</span>'
+        for b, txt in (
+            ("high", "&ge; 75% full carry"),
+            ("mid", "50&ndash;74% partial"),
+            ("low", "&lt; 50% thin"),
+        )
+    )
+    st.markdown(
+        '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:2px 0 6px;">'
+        '<span style="font-size:0.82rem;color:#6b7280;">% of full carry</span>' + chips + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_commodity(commodity: dict, api_key: str, as_of: date, default_rate_pct: float):
+    key = commodity["key"]
+    with st.container(border=True):
+        header = st.container(horizontal=True, vertical_alignment="center")
+        with header:
+            st.subheader(commodity["label"])
+            st.caption(commodity["sublabel"])
+
+        controls = st.container(horizontal=True, vertical_alignment="bottom")
+        with controls:
+            n_contracts = st.slider(
+                "Contract months to load",
+                min_value=3,
+                max_value=10,
+                value=6,
+                key=f"months_{key}",
+                width=230,
+                help="Spread pairs grow quickly — n contracts = n×(n-1)/2 rows.",
+            )
+            storage_rate = st.number_input(
+                f"Daily storage rate ({commodity['storage_unit']})",
+                min_value=0.0,
+                value=commodity["default_storage"],
+                step=0.00005,
+                format="%.5f",
+                key=f"storage_{key}",
+                width=230,
+            )
+            annual_rate_pct = st.number_input(
+                "Annual interest rate (%)",
+                min_value=0.0,
+                max_value=25.0,
+                value=default_rate_pct,
+                step=0.01,
+                key=f"rate_{key}",
+                width=190,
+                help=f"Defaults to live front-month fed funds + {FED_FUNDS_SPREAD_PCT:.2f}%. "
+                "Edit to use your own cost of funds.",
+            )
+            show_full_carry = st.toggle(
+                "Show full carry $",
+                value=False,
+                key=f"cols_{key}",
+                help="Reveal the dollar components behind the percentages: "
+                "full storage, full interest and full carry.",
+            )
+
+        annual_rate = annual_rate_pct / 100
+
+        try:
+            curve = load_curve(commodity["product_code"], api_key, as_of.isoformat(), n_contracts)
+        except MassiveApiError as e:
+            st.error(f"Couldn't load live quotes: {e}")
+            return
+
+        if curve.empty:
+            st.warning("No live contracts returned for this market right now.")
+            return
+
+        try:
+            history = load_history(tuple(curve["ticker"]), api_key, as_of.isoformat())
+        except MassiveApiError as e:
+            st.warning(f"Spread history unavailable: {e}")
+            history = {}
+
+        table = compute_carry_table(
+            curve,
+            storage_rate,
+            annual_rate,
+            commodity["multiplier"],
+            history,
+            history_start=as_of - timedelta(days=HISTORY_LOOKBACK_DAYS),
+        )
+        if table.empty:
+            st.warning("Not enough contract months to build spreads.")
+            return
+
+        front_pair = table.iloc[0]
+        best = table.loc[table["% full carry"].idxmax()]
+        with st.container(horizontal=True):
+            st.metric("Front month", friendly_contract(curve.iloc[0]["ticker"], commodity["product_code"]),
+                      f"{curve.iloc[0]['price']:.2f}", delta_color="off", border=True)
+            st.metric("Widest full-carry capture (any pair)", f"{best['% full carry']:.0%}",
+                      f"{friendly_contract(best['Near'], commodity['product_code'])} / "
+                      f"{friendly_contract(best['Far'], commodity['product_code'])}", delta_color="off", border=True)
+            st.metric("Nearby spread", f"{front_pair['Current']:+.2f}",
+                      f"{friendly_contract(front_pair['Near'], commodity['product_code'])} / "
+                      f"{friendly_contract(front_pair['Far'], commodity['product_code'])}",
+                      delta_color="off", border=True)
+
+        display = table.copy()
+        display["Near"] = display.apply(lambda r: friendly_contract(r["Near"], commodity["product_code"]), axis=1)
+        display["Far"] = display.apply(lambda r: friendly_contract(r["Far"], commodity["product_code"]), axis=1)
+        # blank repeated "Near"/"Near price" within a group so it reads like a merged header row
+        is_group_start = display["near_idx"] != display["near_idx"].shift(1)
+        display["Near price"] = [
+            f"{v:.2f}" if start else "" for v, start in zip(display["Near price"], is_group_start)
+        ]
+        display.loc[~is_group_start, "Near"] = ""
+        for col in ("Low date", "High date"):
+            display[col] = [d.strftime("%b %d, %Y") if pd.notna(d) else "—" for d in display[col]]
+        hidden = ["near_idx", "Sessions"]
+        if not show_full_carry:
+            hidden += FULL_CARRY_COLUMNS
+        display = display.drop(columns=hidden)
+
+        def zebra(row: pd.Series):
+            group_start = row["Near"] != ""
+            base = GROUP_HEADER if group_start else (GROUP_BAND if row.name % 2 == 0 else "")
+            return [base] * len(row)
+
+        def style_pct(col: pd.Series):
+            return [BUCKET_STYLE[carry_bucket(v)] for v in col]
+
+        number_formats = {
+            "Current": "{:+.2f}",
+            "Low": "{:+.2f}",
+            "High": "{:+.2f}",
+            "Sessions": "{:,.0f}",
+            "Full storage": "{:.2f}",
+            "% full storage": "{:.0%}",
+            "Monthly interest": "{:.2f}",
+            "Full interest": "{:.2f}",
+            "% full interest": "{:.0%}",
+            "Full carry": "{:.2f}",
+            "% full carry": "{:.0%}",
+        }
+        styler = (
+            display.style.apply(zebra, axis=1)
+            .apply(style_pct, subset=["% full carry"])
+            .format({k: v for k, v in number_formats.items() if k in display.columns}, na_rep="—")
+        )
+
+        render_legend()
+        with st.container(key=f"tablewrap_{key}"):
+            st.dataframe(styler, hide_index=True, width="stretch",
+                         height=min(38 * (len(display) + 1) + 3, 620))
+        export_row(display, f"carry_table_{key}", key=f"tbl_{key}")
+        traded = table["Sessions"].dropna()
+        depth = (
+            f" Ranges are built from {int(traded.min()):,}–{int(traded.max()):,} sessions per spread"
+            f" (days both legs traded)." if len(traded) else ""
+        )
+        st.caption(
+            f"{len(curve)} contract months loaded → {len(table)} near/deferred spread pairs across the curve. "
+            f"Low/High are the extremes of each spread over the trailing 12 months.{depth}"
+        )
+
+        render_charts(commodity, table, history, curve, api_key, as_of, storage_rate, annual_rate)
+
+
+SEASONAL_YEARS_BACK = 4
+SEASONAL_COLORS = ["#0693e3", "#e8833a", "#5aa469", "#b05fb0", "#9aa5b1"]
+RANGE_CHOICES = {"1Y": 365, "2Y": 730, "All": None}
+REF_STORAGE_COLOR = "#8d6e63"
+REF_INTEREST_COLOR = "#7986cb"
+REF_CARRY_COLOR = "#5aa469"
+FND_COLOR = "#c62828"
+
+
+def first_notice_day(expiration: date) -> date:
+    """CME grain rule: First Notice Day is the last business day of the month
+    preceding the delivery month. Weekend-aware only — exchange holidays are not
+    applied, so a holiday-adjacent FND can land a day late."""
+    first_of_delivery_month = pd.Timestamp(year=expiration.year, month=expiration.month, day=1)
+    return (first_of_delivery_month - pd.offsets.BDay(1)).date()
+
+
+def shift_ticker_year(ticker: str, product_code: str, delta: int) -> str | None:
+    """ZCU6 -> ZCU5 at delta=-1. Massive quotes outrights with a single-digit year,
+    and resolves that digit to the most recent matching contract."""
+    suffix = ticker[len(product_code):]
+    if len(suffix) != 2 or suffix[0] not in MONTH_LETTERS:
+        return None
+    month, year = suffix[0], int(suffix[1])
+    shifted = year + delta
+    if shifted < 0:
+        return None
+    return f"{product_code}{month}{shifted % 10}"
+
+
+@st.cache_data(ttl="6h", show_spinner="Loading seasonal history…")
+def load_seasonal_histories(near: str, far: str, product_code: str, api_key: str,
+                            years_back: int, as_of: str) -> dict[str, pd.Series]:
+    """Settlement history for the selected pair plus its prior-year analogs."""
+    tickers: list[str] = []
+    for back in range(years_back + 1):
+        n = shift_ticker_year(near, product_code, -back)
+        f = shift_ticker_year(far, product_code, -back)
+        if n and f:
+            tickers += [n, f]
+    return get_settlement_histories(tickers, api_key)
+
+
+def carry_components(near_price: float, days: int, storage_rate: float,
+                     annual_rate: float, multiplier: int) -> tuple[float, float]:
+    """(full storage, full interest) in quote units for one near/far pair."""
+    storage_full = days * storage_rate * multiplier
+    interest_full = near_price * annual_rate * days / 360
+    return storage_full, interest_full
+
+
+def build_pair_series(hist: dict, near: str, far: str, mode: str,
+                      storage_rate: float, annual_rate: float, multiplier: int,
+                      expiries: dict | None = None):
+    """Returns (series, near_expiry, far_expiry, storage_full, interest_full_latest).
+
+    A still-trading contract's history ends today, not at its expiration, so the
+    seasonal alignment uses the real expiry where we know it — otherwise the current
+    year sits weeks out of step with the expired analogs."""
+    blank = (None, None, None, None, None)
+    near_h, far_h = hist.get(near), hist.get(far)
+    if near_h is None or far_h is None or not len(near_h) or not len(far_h):
+        return blank
+    spread = (near_h - far_h).dropna()
+    if not len(spread):
+        return blank
+
+    expiries = expiries or {}
+    near_expiry = expiries.get(near, near_h.index.max())
+    far_expiry = expiries.get(far, far_h.index.max())
+    days = (far_expiry - near_expiry).days
+    if days <= 0:
+        return blank
+
+    near_prices = near_h.reindex(spread.index)
+    storage_full, interest_latest = carry_components(
+        float(near_prices.iloc[-1]), days, storage_rate, annual_rate, multiplier
+    )
+    if mode == "nominal":
+        return spread, near_expiry, far_expiry, storage_full, interest_latest
+
+    interest_series = near_prices * annual_rate * days / 360
+    pct = (spread / -(storage_full + interest_series))
+    pct = pct.replace([float("inf"), float("-inf")], pd.NA).dropna()
+    return pct, near_expiry, far_expiry, storage_full, interest_latest
+
+
+def _add_vline(fig, x, text, color):
+    """Draw a vertical marker without add_vline(), which averages its endpoints to
+    place the annotation and so raises TypeError on datetime.date x-values."""
+    x = pd.Timestamp(x) if isinstance(x, date) else x
+    fig.add_shape(type="line", xref="x", yref="paper", x0=x, x1=x, y0=0, y1=1,
+                  line=dict(color=color, dash="dash", width=1.5))
+    fig.add_annotation(x=x, xref="x", y=1.0, yref="paper", text=text, showarrow=False,
+                       yanchor="bottom", font=dict(size=10, color=color))
+
+
+def _style_axes(fig, y_title, x_title, fmt):
+    wm = watermark_path()
+    if wm:
+        fig.add_layout_image(dict(
+            source=watermark_uri(wm), xref="paper", yref="paper",
+            x=0.5, y=0.5, sizex=0.55, sizey=0.55,
+            xanchor="center", yanchor="middle", sizing="contain",
+            opacity=WATERMARK_OPACITY, layer="below",
+        ))
+    fig.update_layout(
+        height=340, margin=dict(l=10, r=78, t=22, b=10),
+        yaxis_title=y_title, xaxis_title=x_title,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0, font=dict(size=10)),
+    )
+    fig.update_yaxes(tickformat=fmt, gridcolor="#eceff1", zeroline=True, zerolinecolor="#cfd8dc")
+    fig.update_xaxes(gridcolor="#eceff1")
+
+
+def _reference_levels(mode, storage_full, interest_full):
+    """The y-values where the spread would exactly cover storage, interest, and both.
+
+    In a carry market the spread is negative, so nominally these sit below zero; as a
+    share of full carry they are the storage and interest slices of 100%."""
+    full_carry = storage_full + interest_full
+    if not full_carry:
+        return []
+    if mode == "nominal":
+        return [
+            (-storage_full, "storage", REF_STORAGE_COLOR),
+            (-interest_full, "interest", REF_INTEREST_COLOR),
+            (-full_carry, "full carry", REF_CARRY_COLOR),
+        ]
+    return [
+        (storage_full / full_carry, "storage", REF_STORAGE_COLOR),
+        (interest_full / full_carry, "interest", REF_INTEREST_COLOR),
+        (1.0, "full carry", REF_CARRY_COLOR),
+    ]
+
+
+def render_charts(commodity: dict, table: pd.DataFrame, history: dict, curve: pd.DataFrame,
+                  api_key: str, as_of: date, storage_rate: float, annual_rate: float):
+    code = commodity["product_code"]
+    key = commodity["key"]
+    expiries = dict(zip(curve["ticker"], curve["expiration"]))
+    tickers = list(curve["ticker"])
+
+    st.divider()
+    st.markdown("##### Spread history & seasonality")
+
+    picker = st.container(horizontal=True, vertical_alignment="bottom")
+    with picker:
+        near = st.selectbox(
+            "Near leg", tickers[:-1], key=f"near_{key}", width=150,
+            format_func=lambda t: friendly_contract(t, code),
+        )
+        later = [t for t in tickers if expiries[t] > expiries[near]]
+        far = st.selectbox(
+            "Far leg", later, key=f"far_{key}", width=150,
+            format_func=lambda t: friendly_contract(t, code),
+        )
+        mode_label = st.segmented_control(
+            "Measure", ["Nominal", "% of full carry"], default="Nominal", key=f"mode_{key}",
+        )
+        range_label = st.segmented_control(
+            "Range", list(RANGE_CHOICES), default="1Y", key=f"range_{key}",
+        )
+        years_back = st.slider(
+            "Prior years", 0, SEASONAL_YEARS_BACK, SEASONAL_YEARS_BACK,
+            key=f"years_{key}", width=170,
+            help="Prior-year analogs of the same spread, e.g. Sep/Dec 2025 beside Sep/Dec 2026.",
+        )
+
+    if not far:
+        st.info("Pick a far leg that expires after the near leg.")
+        return
+
+    mode = "nominal" if (mode_label or "Nominal") == "Nominal" else "carry"
+    window_days = RANGE_CHOICES.get(range_label or "1Y", 365)
+    unit = commodity["storage_unit"].split("/")[0]
+    y_title = f"Spread ({unit})" if mode == "nominal" else "% of full carry"
+    fmt = ".2f" if mode == "nominal" else ".0%"
+    label = f"{friendly_contract(near, code)} / {friendly_contract(far, code)}"
+
+    series, near_exp, far_exp, storage_full, interest_full = build_pair_series(
+        history, near, far, mode, storage_rate, annual_rate, commodity["multiplier"], expiries
+    )
+    left, right = st.columns(2)
+
+    # ---------------------------------------------------------------- history
+    with left:
+        st.caption(f"**{label}** — history")
+        if series is None or not len(series):
+            st.info("No overlapping settlement history for this pair.")
+        else:
+            shown = series
+            if window_days:
+                cutoff = as_of - timedelta(days=window_days)
+                shown = series[series.index >= cutoff]
+            if not len(shown):
+                st.info(f"No sessions inside the {range_label} window.")
+            else:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=list(shown.index), y=list(shown.values), mode="lines", name=label,
+                    line=dict(color=SEASONAL_COLORS[0], width=2),
+                    hovertemplate="%{x|%b %d, %Y}<br>%{y:" + fmt + "}<extra></extra>",
+                ))
+                for y, text, color in _reference_levels(mode, storage_full, interest_full):
+                    fig.add_hline(y=y, line_dash="dot", line_color=color, line_width=1.5,
+                                  annotation_text=text, annotation_position="right",
+                                  annotation_font=dict(size=10, color=color))
+                for exp_date, leg in ((near_exp, "near"), (far_exp, "far")):
+                    fnd = first_notice_day(exp_date)
+                    if shown.index.min() <= fnd <= shown.index.max():
+                        _add_vline(fig, fnd, f"{leg} FND", FND_COLOR)
+                _style_axes(fig, y_title, None, fmt)
+                fig.update_layout(showlegend=False)
+                st.plotly_chart(fig, width="stretch", key=f"hist_{key}",
+                                config=plotly_config(f"{key}_spread_history"))
+                export_row(shown.rename("spread").reset_index().rename(columns={"index": "date"}),
+                           f"{key}_spread_history", key=f"hist_{key}", fig=fig)
+                st.caption(
+                    f"{len(shown):,} sessions · {shown.index.min():%b %d, %Y} → "
+                    f"{shown.index.max():%b %d, %Y} · near FND {first_notice_day(near_exp):%b %d, %Y}"
+                )
+
+    # --------------------------------------------------------------- seasonal
+    with right:
+        st.caption(f"**{label}** — seasonal, aligned on near-leg expiration")
+        seasonal = load_seasonal_histories(near, far, code, api_key, years_back, as_of.isoformat())
+        fig = go.Figure()
+        drawn = 0
+        for back in range(years_back + 1):
+            n = shift_ticker_year(near, code, -back)
+            f = shift_ticker_year(far, code, -back)
+            if not n or not f:
+                continue
+            s, n_exp, _f_exp, s_full, i_full = build_pair_series(
+                seasonal, n, f, mode, storage_rate, annual_rate, commodity["multiplier"], expiries
+            )
+            if s is None or not len(s):
+                continue
+            days_out = [-(n_exp - d).days for d in s.index]
+            keep = [i for i, d in enumerate(days_out) if window_days is None or d >= -window_days]
+            if not keep:
+                continue
+            name = f"{n} / {f}" + (" (current)" if back == 0 else "")
+            fig.add_trace(go.Scatter(
+                x=[days_out[i] for i in keep], y=[s.values[i] for i in keep], mode="lines", name=name,
+                line=dict(color=SEASONAL_COLORS[back % len(SEASONAL_COLORS)],
+                          width=3 if back == 0 else 1.5),
+                opacity=1.0 if back == 0 else 0.7,
+                hovertemplate=f"{name}<br>%{{x}}d to expiry<br>%{{y:{fmt}}}<extra></extra>",
+            ))
+            drawn += 1
+
+        if not drawn:
+            st.info("No prior-year analogs with overlapping history for this pair.")
+        else:
+            for y, text, color in _reference_levels(mode, storage_full, interest_full):
+                fig.add_hline(y=y, line_dash="dot", line_color=color, line_width=1.5,
+                              annotation_text=text, annotation_position="right",
+                              annotation_font=dict(size=10, color=color))
+            fnd_x = -(near_exp - first_notice_day(near_exp)).days
+            if window_days is None or fnd_x >= -window_days:
+                _add_vline(fig, fnd_x, "FND", FND_COLOR)
+            _style_axes(fig, y_title, "Calendar days to near-leg expiration", fmt)
+            st.plotly_chart(fig, width="stretch", key=f"seas_{key}",
+                            config=plotly_config(f"{key}_seasonal"))
+            st.caption(
+                f"{drawn} crop year{'s' if drawn != 1 else ''} overlaid · x = 0 is the near leg's "
+                "expiration, so each year lines up at the same point in its life."
+            )
+
+    st.caption(
+        f"Reference lines are the levels at which **{label}** would exactly cover full storage "
+        f"({storage_full:.2f}), full interest ({interest_full:.2f}) and full carry "
+        f"({storage_full + interest_full:.2f}) in {unit}. Storage is fixed across the pair's life; "
+        "interest floats with the near leg's price, so its line is drawn at the current level. "
+        "FND follows the CME grain rule — last business day before the delivery month "
+        "(weekends only, not exchange holidays)."
+    )
+
+
+BUILDER_MAX_YEARS = 6
+BUILDER_COLORS = ["#1f1f1f", "#0693e3", "#4a7c59", "#e8833a", "#8e44ad",
+                  "#c0392b", "#16a085", "#7f8c8d"]
+
+
+SUMMARY_CONTRACTS = 6
+SUMMARY_COLUMNS = ["Spreads", "Far", "Current", "Monthly Interest", "Full Storage",
+                   "% Full Storage", "Full Interest", "Full Carry", "% Full Carry"]
+SECTION_BAR = ("background:#A9D08E;color:#1f3d1f;font-weight:700;text-align:center;"
+               "padding:3px 0;border-radius:3px;letter-spacing:.04em;font-size:0.95rem;")
+
+
+def sheet_ticker(ticker: str, product_code: str, expiration: date) -> str:
+    """ZCU6 -> ZCU26, matching the workbook's two-digit contract labels."""
+    suffix = ticker[len(product_code):]
+    if len(suffix) != 2:
+        return ticker
+    return f"{product_code}{suffix[0]}{expiration.year % 100:02d}"
+
+
+def summary_section(commodity: dict, api_key: str, as_of: date, annual_rate_pct: float):
+    code = commodity["product_code"]
+    storage_rate = commodity["default_storage"]
+    annual_rate = annual_rate_pct / 100
+
+    st.markdown(
+        f"<div style='{SECTION_BAR}'>{commodity['sublabel'].split(' · ')[0].upper()} "
+        f"{commodity['label'].upper()}</div>",
+        unsafe_allow_html=True,
+    )
+
+    try:
+        curve = load_curve(code, api_key, as_of.isoformat(), SUMMARY_CONTRACTS)
+    except MassiveApiError as e:
+        st.error(f"{commodity['label']}: {e}")
+        return
+    if curve.empty:
+        st.warning(f"{commodity['label']}: no live contracts.")
+        return
+
+    table = compute_carry_table(curve, storage_rate, annual_rate, commodity["multiplier"])
+    if table.empty:
+        st.warning(f"{commodity['label']}: not enough contract months.")
+        return
+
+    expiries = dict(zip(curve["ticker"], curve["expiration"]))
+    left, right = st.columns([1, 4])
+    with left:
+        st.markdown(
+            f"<div style='font-size:0.82rem;line-height:1.7;padding-top:6px;'>"
+            f"Daily Storage Rate&nbsp;&nbsp;<b>{storage_rate:.5f}</b><br>"
+            f"Annual Interest Rate&nbsp;&nbsp;<b>{annual_rate_pct:.2f}%</b><br>"
+            f"<span style='color:#6b7280;'>(Fed Funds + {FED_FUNDS_SPREAD_PCT:.1f}%)</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    display = pd.DataFrame({
+        "near_idx": table["near_idx"],
+        "Spreads": [sheet_ticker(t, code, expiries[t]) for t in table["Near"]],
+        "Far": [sheet_ticker(t, code, expiries[t]) for t in table["Far"]],
+        "Current": table["Current"],
+        "Monthly Interest": table["Monthly interest"],
+        "Full Storage": table["Full storage"],
+        "% Full Storage": table["% full storage"],
+        "Full Interest": table["Full interest"],
+        "Full Carry": table["Full carry"],
+        "% Full Carry": table["% full carry"],
+    })
+    is_group_start = display["near_idx"] != display["near_idx"].shift(1)
+    display.loc[~is_group_start, "Spreads"] = ""
+    display["Monthly Interest"] = [
+        f"{v:.2f}" if start else "" for v, start in zip(display["Monthly Interest"], is_group_start)
+    ]
+    display = display.drop(columns=["near_idx"])
+
+    def zebra(row: pd.Series):
+        base = GROUP_HEADER if row["Spreads"] != "" else (GROUP_BAND if row.name % 2 == 0 else "")
+        return [base] * len(row)
+
+    styler = (
+        display.style.apply(zebra, axis=1)
+        .apply(lambda col: [BUCKET_STYLE[carry_bucket(v)] for v in col], subset=["% Full Carry"])
+        .format({
+            "Current": "{:+.2f}", "Full Storage": "{:.2f}", "% Full Storage": "{:.0%}",
+            "Full Interest": "{:.2f}", "Full Carry": "{:.2f}", "% Full Carry": "{:.0%}",
+        }, na_rep="—")
+    )
+    with right:
+        st.dataframe(styler, hide_index=True, width="stretch",
+                     height=min(35 * (len(display) + 1) + 3, 900))
+    export_row(display, f"cost_of_carry_{commodity['key']}", key=f"sum_{commodity['key']}")
+
+
+def render_summary(api_key: str, as_of: date, default_rate_pct: float):
+    head = st.container(horizontal=True, vertical_alignment="center")
+    with head:
+        st.markdown("### Cost of Carry")
+        st.markdown(
+            f"<div style='text-align:right;font-size:0.82rem;padding-top:10px;'>"
+            f"<b>Date</b>&nbsp;&nbsp;{as_of:%m/%d/%Y}</div>",
+            unsafe_allow_html=True,
+        )
+    st.caption("Spreads are calculated arithmetically and could deviate from board quotes.")
+    render_legend()
+
+    rate_pct = st.number_input(
+        "Annual interest rate applied to every market (%)", min_value=0.0, max_value=25.0,
+        value=default_rate_pct, step=0.01, key="summary_rate", width=330,
+        help=f"Defaults to live front-month fed funds + {FED_FUNDS_SPREAD_PCT:.2f}%.",
+    )
+
+    for commodity in COMMODITIES:
+        summary_section(commodity, api_key, as_of, rate_pct)
+        st.write("")
+
+
+def render_builder(api_key: str, as_of: date, default_rate_pct: float):
+    """Free-form seasonal spread builder: pick a market, pick both legs, pick the
+    measure, and overlay as many prior crop years as the feed can supply."""
+    st.markdown("##### Build a seasonal spread")
+    st.caption(
+        "Pick the market, then both legs. Prior crop years are reconstructed by rolling "
+        "the contract year back (Nov/Jan 2026 → Nov/Jan 2025 → …) and each year is shifted "
+        "so its near leg expires on the same calendar point, which is what lets the lines "
+        "sit on one seasonal axis."
+    )
+
+    row1 = st.container(horizontal=True, vertical_alignment="bottom")
+    with row1:
+        labels = [c["label"] for c in COMMODITIES]
+        pick = st.selectbox("Commodity", labels, key="b_commodity", width=210)
+        commodity = COMMODITIES[labels.index(pick)]
+        code = commodity["product_code"]
+        n_load = st.slider("Contract months", 3, 12, 8, key="b_months", width=190,
+                           help="How far out the curve is loaded, so distant legs can be picked.")
+
+    try:
+        curve = load_curve(code, api_key, as_of.isoformat(), n_load)
+    except MassiveApiError as e:
+        st.error(f"Couldn't load {pick} quotes: {e}")
+        return
+    if curve.empty or len(curve) < 2:
+        st.warning("Not enough live contracts to build a spread for this market.")
+        return
+
+    tickers = list(curve["ticker"])
+    expiries = dict(zip(curve["ticker"], curve["expiration"]))
+
+    row2 = st.container(horizontal=True, vertical_alignment="bottom")
+    with row2:
+        near = st.selectbox("Near leg", tickers[:-1], key="b_near", width=150,
+                            format_func=lambda t: friendly_contract(t, code))
+        later = [t for t in tickers if expiries[t] > expiries[near]]
+        far = st.selectbox("Far leg", later, key="b_far", width=150,
+                           format_func=lambda t: friendly_contract(t, code))
+        mode_label = st.segmented_control("Measure", ["Nominal", "% of full carry"],
+                                          default="Nominal", key="b_mode")
+        years_back = st.slider("Prior crop years", 1, BUILDER_MAX_YEARS, 4, key="b_years", width=190)
+        show_avg = st.toggle("Average", value=True, key="b_avg",
+                             help="Mean across the overlaid years at each point in the season.")
+
+    row3 = st.container(horizontal=True, vertical_alignment="bottom")
+    with row3:
+        storage_rate = st.number_input(
+            f"Daily storage ({commodity['storage_unit']})", min_value=0.0,
+            value=commodity["default_storage"], step=0.00005, format="%.5f",
+            key="b_storage", width=230)
+        annual_rate_pct = st.number_input("Annual interest rate (%)", min_value=0.0, max_value=25.0,
+                                          value=default_rate_pct, step=0.01, key="b_rate", width=190)
+        window_label = st.segmented_control("Season length", ["6M", "1Y", "18M"],
+                                            default="1Y", key="b_window")
+
+    if not far:
+        st.info("Pick a far leg that expires after the near leg.")
+        return
+
+    annual_rate = annual_rate_pct / 100
+    mode = "nominal" if (mode_label or "Nominal") == "Nominal" else "carry"
+    window_days = {"6M": 183, "1Y": 365, "18M": 548}.get(window_label or "1Y", 365)
+    unit = commodity["storage_unit"].split("/")[0]
+    y_title = f"Spread ({unit})" if mode == "nominal" else "% of full carry"
+    fmt = ".2f" if mode == "nominal" else ".0%"
+    pair_label = f"{friendly_contract(near, code)} / {friendly_contract(far, code)}"
+
+    hist = load_seasonal_histories(near, far, code, api_key, years_back, as_of.isoformat())
+    anchor_expiry = expiries[near]
+
+    fig = go.Figure()
+    by_dte: dict[str, pd.Series] = {}
+    storage_full = interest_full = None
+    skipped: list[str] = []
+
+    for back in range(years_back + 1):
+        n = shift_ticker_year(near, code, -back)
+        f = shift_ticker_year(far, code, -back)
+        if not n or not f:
+            continue
+        series, near_exp, _far_exp, s_full, i_full = build_pair_series(
+            hist, n, f, mode, storage_rate, annual_rate, commodity["multiplier"], expiries
+        )
+        if series is None or not len(series):
+            skipped.append(f"{n}/{f}")
+            continue
+        if back == 0:
+            storage_full, interest_full = s_full, i_full
+
+        dte = [-(near_exp - d).days for d in series.index]
+        keep = [i for i, d in enumerate(dte) if d >= -window_days]
+        if not keep:
+            skipped.append(f"{n}/{f}")
+            continue
+
+        # shift every year onto the current contract's calendar so months line up
+        xs = [anchor_expiry + timedelta(days=dte[i]) for i in keep]
+        ys = [series.values[i] for i in keep]
+        name = f"{n} / {f}"
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines", name=name + (" (current)" if back == 0 else ""),
+            line=dict(color=BUILDER_COLORS[back % len(BUILDER_COLORS)],
+                      width=3.5 if back == 0 else 1.6),
+            opacity=1.0 if back == 0 else 0.8,
+            hovertemplate=f"{name}<br>%{{y:{fmt}}}<extra></extra>",
+        ))
+        by_dte[name] = pd.Series([series.values[i] for i in keep],
+                                 index=pd.Index([dte[i] for i in keep], name="dte"))
+
+    if not by_dte:
+        st.warning("No overlapping settlement history for this pair in any year.")
+        return
+
+    if show_avg and len(by_dte) > 1:
+        # Each crop year trades on its own session dates, so averaging the raw points
+        # would jump between "mean of five years" and "one lonely year". Put every year
+        # on a common daily grid first, then only average where most years are present.
+        grid = pd.RangeIndex(-window_days, 1)
+        aligned = {}
+        for name, s_dte in by_dte.items():
+            clean = s_dte[~s_dte.index.duplicated(keep="last")].sort_index()
+            aligned[name] = clean.reindex(grid).interpolate(limit_area="inside")
+        frame = pd.DataFrame(aligned)
+        required = max(2, (len(aligned) + 1) // 2)
+        avg = frame.mean(axis=1, skipna=True)[frame.count(axis=1) >= required]
+        if len(avg):
+            fig.add_trace(go.Scatter(
+                x=[anchor_expiry + timedelta(days=int(d)) for d in avg.index],
+                y=list(avg.values), mode="lines", name=f"Avg ({len(aligned)}yr)",
+                line=dict(color="#111111", width=2.2, dash="dot"),
+                hovertemplate=f"Avg<br>%{{y:{fmt}}}<extra></extra>",
+            ))
+
+    if storage_full is not None:
+        for y, text, color in _reference_levels(mode, storage_full, interest_full):
+            fig.add_hline(y=y, line_dash="dot", line_color=color, line_width=1.5,
+                          annotation_text=text, annotation_position="right",
+                          annotation_font=dict(size=10, color=color))
+    fnd = first_notice_day(anchor_expiry)
+    if fnd >= anchor_expiry - timedelta(days=window_days):
+        _add_vline(fig, fnd, "FND", FND_COLOR)
+
+    wm = watermark_path()
+    if wm:
+        fig.add_layout_image(dict(
+            source=watermark_uri(wm), xref="paper", yref="paper", x=0.5, y=0.5,
+            sizex=0.45, sizey=0.45, xanchor="center", yanchor="middle",
+            sizing="contain", opacity=WATERMARK_OPACITY, layer="below",
+        ))
+    fig.update_layout(
+        height=560, margin=dict(l=10, r=80, t=30, b=10),
+        yaxis_title=y_title, xaxis_title=None,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0, font=dict(size=11)),
+        title=dict(text=f"{commodity['label']} — {pair_label} seasonal spread",
+                   x=0.5, xanchor="center", font=dict(size=16)),
+    )
+    fig.update_yaxes(tickformat=fmt, gridcolor="#eceff1", zeroline=True, zerolinecolor="#cfd8dc")
+    fig.update_xaxes(gridcolor="#eceff1", tickformat="%b", dtick="M1")
+    st.plotly_chart(fig, width="stretch", key="builder_chart",
+                    config=plotly_config(f"{code}_{near}_{far}_seasonal"))
+    export_row(pd.DataFrame(by_dte).sort_index().reset_index(),
+               f"{code}_{near}_{far}_seasonal", key="builder", fig=fig)
+
+    note = (
+        f"{len(by_dte)} crop year{'s' if len(by_dte) != 1 else ''} overlaid · x-axis is the "
+        f"current contract's calendar, with each prior year shifted so its near leg expires "
+        f"at the same point."
+    )
+    if skipped:
+        note += f" No usable history for {', '.join(skipped)} — the feed's daily bars start 2021-09-02."
+    st.caption(note)
+
+
+def main():
+    col_logo, col_title = st.columns([1, 6], vertical_alignment="center")
+    with col_logo:
+        st.image(asset(LOGO_FILE), width=150)
+    with col_title:
+        st.title("Cost of Carry Calculator")
+    st.caption(
+        "Live CBOT & MGEX grain futures curves priced against full financial cost of carry "
+        "(storage + interest), every near month against every deferred month. "
+        "Spreads are calculated arithmetically and may deviate from board quotes. "
+        f"Data as of {datetime.now():%b %d, %Y %I:%M %p} · quotes delayed per Massive API."
+    )
+
+    api_key = get_api_key()
+    if not api_key:
+        st.error(
+            "No MASSIVE_API_KEY found. Add it to `.streamlit/secrets.toml` "
+            '(`MASSIVE_API_KEY = "..."`) or as an environment variable.'
+        )
+        st.stop()
+
+    css = table_watermark_css()
+    if css:
+        st.markdown(css, unsafe_allow_html=True)
+
+    as_of = date.today()
+
+    try:
+        ff = load_fed_funds(api_key, as_of.isoformat())
+        default_rate_pct = round(ff["rate_pct"] + FED_FUNDS_SPREAD_PCT, 2)
+        st.caption(
+            f"Interest rate defaults to fed funds **{ff['rate_pct']:.3f}%** "
+            f"(front-month {ff['ticker']} @ {ff['price']:.4f}, settles {ff['expiration']:%b %d, %Y}) "
+            f"+ {FED_FUNDS_SPREAD_PCT:.2f}% = **{default_rate_pct:.2f}%** — editable per market below."
+        )
+        source_line = (
+            f"Front-month **{ff['ticker']}** last traded **{ff['price']:.4f}**, "
+            f"so the implied rate is `100 − {ff['price']:.4f}` = **{ff['rate_pct']:.3f}%**."
+        )
+    except MassiveApiError as e:
+        default_rate_pct = FALLBACK_ANNUAL_RATE_PCT
+        st.caption(
+            f"Live fed funds unavailable ({e}); interest rate falls back to "
+            f"{FALLBACK_ANNUAL_RATE_PCT:.2f}%."
+        )
+        source_line = (
+            f"Live fed funds could not be read, so the rate falls back to a static "
+            f"**{FALLBACK_ANNUAL_RATE_PCT:.2f}%**."
+        )
+
+    with st.expander("How the interest rate is derived, and how carry is calculated"):
+        st.markdown(
+            f"""
+**1 · Fed funds, from the futures board**
+
+The rate is read live from the CME **30-Day Federal Funds future (`ZQ`)**. These settle
+against the average daily *effective* fed funds rate over the contract month and are
+quoted as `100 − rate`, so the front month is the market's read on the current rate.
+{source_line}
+
+**2 · The carry spread**
+
+The reference workbook's convention is **fed funds + {FED_FUNDS_SPREAD_PCT:.2f}%**, approximating a
+commercial cost of funds rather than the risk-free rate. That sum seeds the
+*Annual interest rate* box on every market, and each tab can be overridden
+independently with your own cost of funds.
+
+**3 · Interest cost of holding the near contract**
+
+For each near/deferred pair, interest accrues on the near contract's price over the
+days between the two expirations, on a **360-day** basis:
+
+```
+full interest = near price × annual rate × days ÷ 360
+```
+
+**4 · Full carry, and what the percentage means**
+
+Storage is added to interest to give the total cost of carrying the grain:
+
+```
+full storage    = days × daily storage rate     (×100 on the cents/bu markets)
+full carry      = full storage + full interest
+% of full carry = spread ÷ −(full storage + full interest)
+```
+
+A spread paying **100%** of full carry covers storage and interest exactly — the market
+is paying you to hold grain. Below that, carrying costs more than the board returns.
+Because the near leg is the more expensive one in a carry market the spread is negative,
+hence the sign flip in the denominator.
+"""
+        )
+
+    tabs = st.tabs(["Summary", "Spread Builder"] + [c["label"] for c in COMMODITIES])
+    with tabs[0]:
+        render_summary(api_key, as_of, default_rate_pct)
+    with tabs[1]:
+        render_builder(api_key, as_of, default_rate_pct)
+    for tab, commodity in zip(tabs[2:], COMMODITIES):
+        with tab:
+            render_commodity(commodity, api_key, as_of, default_rate_pct)
+
+
+if __name__ == "__main__":
+    main()
