@@ -870,6 +870,136 @@ def render_summary(api_key: str, as_of: date, default_rate_pct: float):
         st.write("")
 
 
+MATRIX_METRICS = ["Market Carry", "Cost of Carry", "% Full Carry"]
+MATRIX_META = ["Symbol", "Month", "Price", ""]
+POS_STYLE = "color:#0b8043;font-weight:600;"
+NEG_STYLE = "color:#c5221f;font-weight:600;"
+GROUP_TOP = "border-top:2px solid #b8c4ce;"
+METRIC_BAND = "background-color:#f3f6f9;"
+
+
+def tick_price(price: float, multiplier: int) -> str:
+    """Grain board notation: 515.00 -> 515-0, 552.75 -> 552-6 (eighths of a cent).
+    Meal ($/ton) and oil (cents/lb) aren't quoted that way, so they stay decimal."""
+    if multiplier != 100:
+        return f"{price:.2f}"
+    whole = int(price)
+    eighths = int(round((price - whole) * 8))
+    if eighths >= 8:
+        whole, eighths = whole + 1, 0
+    return f"{whole}-{eighths}"
+
+
+def build_matrix(curve: pd.DataFrame, code: str, storage_rate: float,
+                 annual_rate: float, multiplier: int):
+    """Near contracts down the side, deferred across the top; three rows per near month.
+
+    Market Carry is far - near, i.e. carry quoted positive, which is the opposite sign
+    to the spread column in the other tables."""
+    legs = list(curve.itertuples(index=False))
+    labels = [sheet_ticker(r.ticker, code, r.expiration) for r in legs]
+    rows = []
+    for i, near in enumerate(legs):
+        for metric in MATRIX_METRICS:
+            row = {
+                "Symbol": labels[i] if metric == "Cost of Carry" else "",
+                "Month": f"{near.expiration:%b %y}" if metric == "Cost of Carry" else "",
+                "Price": tick_price(near.price, multiplier) if metric == "Cost of Carry" else "",
+                "": metric,
+            }
+            for j, far in enumerate(legs):
+                col = labels[j]
+                if j <= i:
+                    row[col] = None
+                    continue
+                days = (far.expiration - near.expiration).days
+                if days <= 0:
+                    row[col] = None
+                    continue
+                market_carry = far.price - near.price
+                storage_full = days * storage_rate * multiplier
+                interest_full = near.price * annual_rate * days / 360
+                cost_of_carry = storage_full + interest_full
+                if metric == "Market Carry":
+                    row[col] = market_carry
+                elif metric == "Cost of Carry":
+                    row[col] = cost_of_carry
+                else:
+                    row[col] = market_carry / cost_of_carry if cost_of_carry else None
+            rows.append(row)
+    return pd.DataFrame(rows), labels
+
+
+def render_matrix(api_key: str, as_of: date, default_rate_pct: float):
+    st.markdown("##### Spread matrix")
+    st.caption(
+        "Every near month against every deferred month at once. **Market Carry** is the "
+        "deferred less the near — carry quoted positive, the opposite sign to the spread "
+        "columns elsewhere in this app. **Cost of Carry** is full storage plus full interest "
+        "over the same span, and **% Full Carry** is the first divided by the second."
+    )
+
+    controls = st.container(horizontal=True, vertical_alignment="bottom")
+    with controls:
+        names = [c["label"] for c in COMMODITIES]
+        pick = st.selectbox("Commodity", names, key="mx_commodity", width=210)
+        commodity = COMMODITIES[names.index(pick)]
+        code = commodity["product_code"]
+        n_load = st.slider("Contract months", 3, 12, 9, key="mx_months", width=200)
+        storage_rate = st.number_input(
+            f"Daily storage ({commodity['storage_unit']})", min_value=0.0,
+            value=commodity["default_storage"], step=0.00005, format="%.5f",
+            key="mx_storage", width=220)
+        annual_rate_pct = st.number_input("Annual interest rate (%)", min_value=0.0, max_value=25.0,
+                                          value=default_rate_pct, step=0.01, key="mx_rate", width=190)
+
+    try:
+        curve = load_curve(code, api_key, as_of.isoformat(), n_load)
+    except MassiveApiError as e:
+        st.error(f"Couldn't load {pick} quotes: {e}")
+        return
+    if curve.empty or len(curve) < 2:
+        st.warning("Not enough live contracts to build a matrix.")
+        return
+
+    frame, labels = build_matrix(curve, code, storage_rate, annual_rate_pct / 100,
+                                 commodity["multiplier"])
+
+    # Cells are rendered to strings here rather than via Styler.format: the percent rows
+    # and the value rows need different formats within the same column, and a second
+    # format(subset=...) call drops the na_rep, leaving literal "None" in the empty half.
+    def cell(value, metric: str) -> str:
+        if value is None or pd.isna(value):
+            return ""
+        return f"{value:+.2%}" if metric == "% Full Carry" else f"{value:.2f}"
+
+    display = frame.copy()
+    for col in labels:
+        display[col] = [cell(v, m) for v, m in zip(frame[col], frame[""])]
+
+    def style_row(row: pd.Series):
+        source = frame.iloc[row.name]
+        metric = source[""]
+        base = GROUP_TOP if metric == "Market Carry" else ""
+        if metric == "Cost of Carry":
+            base += METRIC_BAND
+        out = []
+        for col in row.index:
+            value = source[col] if col in labels else None
+            if value is None or pd.isna(value) or metric != "% Full Carry":
+                out.append(base)
+            else:
+                out.append(base + (POS_STYLE if value >= 0 else NEG_STYLE))
+        return out
+
+    styler = display.style.apply(style_row, axis=1)
+
+    with st.container(key="tablewrap_matrix"):
+        st.dataframe(styler, hide_index=True, width="stretch",
+                     height=min(35 * (len(display) + 1) + 3, 900))
+    export_row(display, f"spread_matrix_{commodity['key']}", key="matrix")
+
+
 def render_builder(api_key: str, as_of: date, default_rate_pct: float):
     """Free-form seasonal spread builder: pick a market, pick both legs, pick the
     measure, and overlay as many prior crop years as the feed can supply."""
@@ -1139,12 +1269,15 @@ hence the sign flip in the denominator.
 """
         )
 
-    tabs = st.tabs(["Summary", "Spread Builder"] + [c["label"] for c in COMMODITIES])
+    tabs = st.tabs(["Summary", "Spread Builder", "Spread Matrix"]
+                   + [c["label"] for c in COMMODITIES])
     with tabs[0]:
         render_summary(api_key, as_of, default_rate_pct)
     with tabs[1]:
         render_builder(api_key, as_of, default_rate_pct)
-    for tab, commodity in zip(tabs[2:], COMMODITIES):
+    with tabs[2]:
+        render_matrix(api_key, as_of, default_rate_pct)
+    for tab, commodity in zip(tabs[3:], COMMODITIES):
         with tab:
             render_commodity(commodity, api_key, as_of, default_rate_pct)
 
