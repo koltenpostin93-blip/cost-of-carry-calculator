@@ -622,12 +622,13 @@ def render_charts(commodity: dict, table: pd.DataFrame, history: dict, curve: pd
     picker = st.container(horizontal=True, vertical_alignment="bottom")
     with picker:
         near = st.selectbox(
-            "Near leg", tickers[:-1], key=f"near_{key}", width=150,
+            "Near leg", tickers[:-1], key=f"near_{key}_{len(tickers)}", width=150,
             format_func=lambda t: friendly_contract(t, code),
         )
-        later = [t for t in tickers if expiries[t] > expiries[near]]
+        later = [t for t in tickers
+                 if expiries[t] > expiries.get(near, curve["expiration"].min())]
         far = st.selectbox(
-            "Far leg", later, key=f"far_{key}", width=150,
+            "Far leg", later, key=f"far_{key}_{len(tickers)}_{near}", width=150,
             format_func=lambda t: friendly_contract(t, code),
         )
         mode_label = st.segmented_control(
@@ -1074,9 +1075,12 @@ def render_crush(api_key: str, as_of: date):
     export_row(display, "soybean_crush_curve", key="crush_curve")
 
     # ── history & seasonality for one crush month ────────────────────────────
-    pick = st.selectbox("Crush month", list(curve["ticker"]), key="crush_pick", width=190,
+    pick = st.selectbox("Crush month", list(curve["ticker"]),
+                        key=f"crush_pick_{n_contracts}", width=190,
                         format_func=lambda t: friendly_contract(t, CRUSH_CODE))
     bean_for = dict(zip(curve["ticker"], curve["Beans"]))
+    if pick not in bean_for:
+        pick = curve.iloc[0]["ticker"]
     anchor_expiry = dict(zip(curve["ticker"], curve["expiration"]))[pick]
 
     bean_tickers = [bean_for[pick]]
@@ -1247,11 +1251,15 @@ def render_builder(api_key: str, as_of: date, default_rate_pct: float):
 
     row2 = st.container(horizontal=True, vertical_alignment="bottom")
     with row2:
-        near = st.selectbox("Near leg", tickers[:-1], key="b_near", width=150,
-                            format_func=lambda t: friendly_contract(t, code))
-        later = [t for t in tickers if expiries[t] > expiries[near]]
-        far = st.selectbox("Far leg", later, key="b_far", width=150,
-                           format_func=lambda t: friendly_contract(t, code))
+        # Keyed on the commodity and curve length: without that, switching market
+        # leaves a ticker from the previous curve in session state and the expiries
+        # lookup below raises KeyError. The .get guards the first render after a swap.
+        near = st.selectbox("Near leg", tickers[:-1], key=f"b_near_{code}_{n_load}",
+                            width=150, format_func=lambda t: friendly_contract(t, code))
+        _near_exp = expiries.get(near, curve["expiration"].min())
+        later = [t for t in tickers if expiries[t] > _near_exp]
+        far = st.selectbox("Far leg", later, key=f"b_far_{code}_{n_load}_{near}",
+                           width=150, format_func=lambda t: friendly_contract(t, code))
         mode_label = st.segmented_control("Measure", ["Nominal", "% of full carry"],
                                           default="Nominal", key="b_mode")
         years_back = st.slider("Prior crop years", 1, BUILDER_MAX_YEARS, 4, key="b_years", width=190)
@@ -1282,7 +1290,7 @@ def render_builder(api_key: str, as_of: date, default_rate_pct: float):
     pair_label = f"{friendly_contract(near, code)} / {friendly_contract(far, code)}"
 
     hist = load_seasonal_histories(near, far, code, api_key, years_back, as_of.isoformat())
-    anchor_expiry = expiries[near]
+    anchor_expiry = expiries.get(near, curve["expiration"].min())
 
     fig = go.Figure()
     by_dte: dict[str, pd.Series] = {}
