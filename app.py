@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from history_archive import ARCHIVE_CUTOFF_YEAR, load_price_archive
 from massive_api import (MassiveApiError, get_fed_funds_rate, get_futures_curve,
                          get_settlement_histories)
 
@@ -472,6 +473,10 @@ def render_commodity(commodity: dict, api_key: str, as_of: date, default_rate_pc
 
 
 SEASONAL_YEARS_BACK = 4
+# Corn/soybean calendar spreads can reach back through the CSV archive (contract years
+# 2008+) rather than just Massive's live ~2021-09 window — other markets simply run out
+# of data past ~5 years back and the loop already skips those gracefully.
+DEEP_SEASONAL_YEARS_BACK = 18
 SEASONAL_COLORS = ["#0693e3", "#e8833a", "#5aa469", "#b05fb0", "#9aa5b1"]
 RANGE_CHOICES = {"1Y": 365, "2Y": 730, "All": None}
 REF_STORAGE_COLOR = "#8d6e63"
@@ -501,17 +506,66 @@ def shift_ticker_year(ticker: str, product_code: str, delta: int) -> str | None:
     return f"{product_code}{month}{shifted % 10}"
 
 
+def month_letter_of(ticker: str, product_code: str) -> str | None:
+    suffix = ticker[len(product_code):]
+    return suffix[0] if len(suffix) == 2 and suffix[0] in MONTH_LETTERS else None
+
+
+@st.cache_resource(show_spinner=False)
+def price_archive() -> dict[tuple[str, str, int], pd.Series]:
+    return load_price_archive()
+
+
+def deep_year_key(product_code: str, month_letter: str, year: int) -> str:
+    """A ticker-shaped key that also carries the full 4-digit year, so it can't collide
+    the way Massive's own single-digit-year outrights (`ZCZ6`) do past ~9 years back."""
+    return f"{product_code}{month_letter}_{year}"
+
+
 @st.cache_data(ttl="6h", show_spinner="Loading seasonal history…")
-def load_seasonal_histories(near: str, far: str, product_code: str, api_key: str,
-                            years_back: int, as_of: str) -> dict[str, pd.Series]:
-    """Settlement history for the selected pair plus its prior-year analogs."""
-    tickers: list[str] = []
+def load_deep_seasonal_histories(near: str, far: str, product_code: str, api_key: str,
+                                 years_back: int, near_expiry: date,
+                                 far_expiry: date) -> tuple[dict[str, pd.Series], dict[str, date]]:
+    """Prior-year analogs of a near/far pair, bridging Massive (contract years >= 2022)
+    with the pre-2021 CSV archive (corn/soybeans only — see history_archive.py) so the
+    lookback isn't capped at Massive's ~5-year live window. Returns dicts keyed by
+    `deep_year_key`, drop-in compatible with `build_pair_series`.
+    """
+    near_letter = month_letter_of(near, product_code)
+    far_letter = month_letter_of(far, product_code)
+    if not near_letter or not far_letter:
+        return {}, {}
+
+    archive = price_archive()
+    hist: dict[str, pd.Series] = {}
+    expiries: dict[str, date] = {}
+    live_tickers: dict[str, str] = {}  # massive ticker -> deep key
+
     for back in range(years_back + 1):
-        n = shift_ticker_year(near, product_code, -back)
-        f = shift_ticker_year(far, product_code, -back)
-        if n and f:
-            tickers += [n, f]
-    return get_settlement_histories(tickers, api_key)
+        for letter, base_expiry in ((near_letter, near_expiry), (far_letter, far_expiry)):
+            year = base_expiry.year - back
+            key = deep_year_key(product_code, letter, year)
+            if key in expiries or key in live_tickers.values():
+                continue
+            if year >= ARCHIVE_CUTOFF_YEAR:
+                live_tickers[f"{product_code}{letter}{year % 10}"] = key
+            else:
+                series = archive.get((product_code, letter, year))
+                if series is not None and len(series):
+                    hist[key] = series
+                    expiries[key] = date(year, base_expiry.month, min(base_expiry.day, 28))
+
+    if live_tickers:
+        fetched = get_settlement_histories(list(live_tickers), api_key)
+        for ticker, key in live_tickers.items():
+            series = fetched.get(ticker)
+            if series is not None and len(series):
+                hist[key] = series
+                letter, year = key.split("_")[0][len(product_code):], int(key.rsplit("_", 1)[1])
+                base_expiry = near_expiry if letter == near_letter else far_expiry
+                expiries[key] = date(year, base_expiry.month, min(base_expiry.day, 28))
+
+    return hist, expiries
 
 
 def carry_components(near_price: float, days: int, storage_rate: float,
@@ -637,10 +691,17 @@ def render_charts(commodity: dict, table: pd.DataFrame, history: dict, curve: pd
         range_label = st.segmented_control(
             "Range", list(RANGE_CHOICES), default="1Y", key=f"range_{key}",
         )
+        has_archive = code in ("ZC", "ZS")
+        max_years = DEEP_SEASONAL_YEARS_BACK if has_archive else SEASONAL_YEARS_BACK
         years_back = st.slider(
-            "Prior years", 0, SEASONAL_YEARS_BACK, SEASONAL_YEARS_BACK,
+            "Prior years", 0, max_years, SEASONAL_YEARS_BACK,
             key=f"years_{key}", width=170,
-            help="Prior-year analogs of the same spread, e.g. Sep/Dec 2025 beside Sep/Dec 2026.",
+            help="Prior-year analogs of the same spread, e.g. Sep/Dec 2025 beside Sep/Dec 2026."
+            + (" Corn/soybeans reach back through the 2008+ archive." if has_archive else ""),
+        )
+        show_avg = st.toggle(
+            "Average", value=True, key=f"avg_{key}",
+            help="Mean across the overlaid years at each point in the season.",
         )
 
     if not far:
@@ -700,16 +761,18 @@ def render_charts(commodity: dict, table: pd.DataFrame, history: dict, curve: pd
     # --------------------------------------------------------------- seasonal
     with right:
         st.caption(f"**{label}** — seasonal, aligned on near-leg expiration")
-        seasonal = load_seasonal_histories(near, far, code, api_key, years_back, as_of.isoformat())
+        near_letter, far_letter = month_letter_of(near, code), month_letter_of(far, code)
+        deep_hist, deep_expiries = load_deep_seasonal_histories(
+            near, far, code, api_key, years_back, expiries[near], expiries[far]
+        )
         fig = go.Figure()
         drawn = 0
+        by_dte: dict[str, pd.Series] = {}
         for back in range(years_back + 1):
-            n = shift_ticker_year(near, code, -back)
-            f = shift_ticker_year(far, code, -back)
-            if not n or not f:
-                continue
+            n = deep_year_key(code, near_letter, expiries[near].year - back)
+            f = deep_year_key(code, far_letter, expiries[far].year - back)
             s, n_exp, _f_exp, s_full, i_full = build_pair_series(
-                seasonal, n, f, mode, storage_rate, annual_rate, commodity["multiplier"], expiries
+                deep_hist, n, f, mode, storage_rate, annual_rate, commodity["multiplier"], deep_expiries
             )
             if s is None or not len(s):
                 continue
@@ -717,7 +780,9 @@ def render_charts(commodity: dict, table: pd.DataFrame, history: dict, curve: pd
             keep = [i for i, d in enumerate(days_out) if window_days is None or d >= -window_days]
             if not keep:
                 continue
-            name = f"{n} / {f}" + (" (current)" if back == 0 else "")
+            name = (f"{MONTH_LETTERS[near_letter]} {expiries[near].year - back} / "
+                    f"{MONTH_LETTERS[far_letter]} {expiries[far].year - back}"
+                    + (" (current)" if back == 0 else ""))
             fig.add_trace(go.Scatter(
                 x=[days_out[i] for i in keep], y=[s.values[i] for i in keep], mode="lines", name=name,
                 line=dict(color=SEASONAL_COLORS[back % len(SEASONAL_COLORS)],
@@ -725,11 +790,34 @@ def render_charts(commodity: dict, table: pd.DataFrame, history: dict, curve: pd
                 opacity=1.0 if back == 0 else 0.7,
                 hovertemplate=f"{name}<br>%{{x}}d to expiry<br>%{{y:{fmt}}}<extra></extra>",
             ))
+            by_dte[name] = pd.Series([s.values[i] for i in keep],
+                                     index=pd.Index([days_out[i] for i in keep], name="dte"))
             drawn += 1
 
         if not drawn:
             st.info("No prior-year analogs with overlapping history for this pair.")
         else:
+            if show_avg and len(by_dte) > 1:
+                # Each crop year trades on its own session dates, so averaging the raw
+                # points would jump between "mean of five years" and "one lonely year".
+                # Put every year on a common daily grid first, then only average where
+                # most years are present.
+                lo = min(min(s.index) for s in by_dte.values())
+                grid = pd.RangeIndex(int(lo), 1)
+                aligned = {}
+                for nm, s_dte in by_dte.items():
+                    clean = s_dte[~s_dte.index.duplicated(keep="last")].sort_index()
+                    aligned[nm] = clean.reindex(grid).interpolate(limit_area="inside")
+                frame = pd.DataFrame(aligned)
+                required = max(2, (len(aligned) + 1) // 2)
+                avg = frame.mean(axis=1, skipna=True)[frame.count(axis=1) >= required]
+                if len(avg):
+                    fig.add_trace(go.Scatter(
+                        x=list(avg.index), y=list(avg.values), mode="lines",
+                        name=f"Avg ({len(aligned)}yr)",
+                        line=dict(color="#111111", width=2.2, dash="dot"),
+                        hovertemplate=f"Avg<br>%{{x}}d to expiry<br>%{{y:{fmt}}}<extra></extra>",
+                    ))
             for y, text, color in _reference_levels(mode, storage_full, interest_full):
                 fig.add_hline(y=y, line_dash="dot", line_color=color, line_width=1.5,
                               annotation_text=text, annotation_position="right",
@@ -1217,69 +1305,132 @@ def render_matrix(api_key: str, as_of: date, default_rate_pct: float):
     export_row(display, f"spread_matrix_{commodity['key']}", key="matrix")
 
 
-def render_builder(api_key: str, as_of: date, default_rate_pct: float):
-    """Free-form seasonal spread builder: pick a market, pick both legs, pick the
-    measure, and overlay as many prior crop years as the feed can supply."""
-    st.markdown("##### Build a seasonal spread")
-    st.caption(
-        "Pick the market, then both legs. Prior crop years are reconstructed by rolling "
-        "the contract year back (Nov/Jan 2026 → Nov/Jan 2025 → …) and each year is shifted "
-        "so its near leg expires on the same calendar point, which is what lets the lines "
-        "sit on one seasonal axis."
-    )
+MIN_BUILDER_LEGS = 2
+MAX_BUILDER_LEGS = 6
+BUILDER_CURVE_MONTHS = 10
 
-    row1 = st.container(horizontal=True, vertical_alignment="bottom")
-    with row1:
-        labels = [c["label"] for c in COMMODITIES]
-        pick = st.selectbox("Commodity", labels, key="b_commodity", width=210)
-        commodity = COMMODITIES[labels.index(pick)]
-        code = commodity["product_code"]
-        n_load = st.slider("Contract months", 3, 12, 8, key="b_months", width=190,
-                           help="How far out the curve is loaded, so distant legs can be picked.")
 
-    try:
-        curve = load_curve(code, api_key, as_of.isoformat(), n_load)
-    except MassiveApiError as e:
-        st.error(f"Couldn't load {pick} quotes: {e}")
+def _default_leg_weight(i: int) -> float:
+    """+1, -1, +1, -1, … — a plain calendar spread by default; edit for flies/ratios."""
+    return 1.0 if i % 2 == 0 else -1.0
+
+
+def render_leg_pickers(api_key: str, as_of: date) -> list[dict] | None:
+    """The leg rows shared by every mode: market, contract, weight — plus the
+    +/- Add leg controls that let the spread grow past two legs."""
+    if "builder_legs" not in st.session_state:
+        st.session_state.builder_legs = MIN_BUILDER_LEGS
+
+    ctrl = st.container(horizontal=True, vertical_alignment="center")
+    with ctrl:
+        if st.button("+ Add leg", key="b_add_leg",
+                     disabled=st.session_state.builder_legs >= MAX_BUILDER_LEGS):
+            st.session_state.builder_legs += 1
+        if st.button("− Remove leg", key="b_remove_leg",
+                     disabled=st.session_state.builder_legs <= MIN_BUILDER_LEGS):
+            st.session_state.builder_legs -= 1
+        st.caption(f"{st.session_state.builder_legs} leg(s) — each can be its own market "
+                   "and contract month, so a butterfly, condor, or cross-commodity spread "
+                   "all build the same way.")
+
+    labels = [c["label"] for c in COMMODITIES]
+    legs = []
+    for i in range(st.session_state.builder_legs):
+        row = st.container(horizontal=True, vertical_alignment="bottom")
+        with row:
+            commodity_label = st.selectbox(
+                f"Leg {i + 1} market", labels, key=f"b_leg{i}_commodity", width=190,
+            )
+            commodity = COMMODITIES[labels.index(commodity_label)]
+            code = commodity["product_code"]
+            try:
+                curve = load_curve(code, api_key, as_of.isoformat(), BUILDER_CURVE_MONTHS)
+            except MassiveApiError as e:
+                st.error(f"Leg {i + 1}: couldn't load {commodity_label} quotes: {e}")
+                return None
+            if curve.empty:
+                st.warning(f"Leg {i + 1}: no live contracts for {commodity_label}.")
+                return None
+            tickers = list(curve["ticker"])
+            contract = st.selectbox(
+                # keyed on the commodity too — otherwise switching Leg i's market can
+                # leave this widget holding a ticker from the old commodity's curve,
+                # which isn't in the new options list at all
+                f"Leg {i + 1} contract", tickers, key=f"b_leg{i}_contract_{code}", width=150,
+                index=min(i, len(tickers) - 1),
+                format_func=lambda t, code=code: friendly_contract(t, code),
+            )
+            weight = st.number_input(
+                f"Leg {i + 1} weight", value=_default_leg_weight(i), step=1.0,
+                key=f"b_leg{i}_weight", width=130,
+                help="Positive = long, negative = short. Use non-±1 weights for ratio "
+                "spreads (e.g. a crush-style combo) or fly wings.",
+            )
+        matches = curve.loc[curve["ticker"] == contract]
+        row_match = matches.iloc[0] if len(matches) else curve.iloc[0]
+        legs.append({
+            "commodity": commodity, "product_code": code, "ticker": contract,
+            "weight": float(weight), "price": float(row_match["price"]),
+            "expiration": row_match["expiration"],
+        })
+    return legs
+
+
+def render_combo_history(legs: list[dict], unit_label: str, as_of: date, api_key: str):
+    hist = load_history(tuple(sorted({l["ticker"] for l in legs})), api_key, as_of.isoformat())
+    frame = pd.DataFrame({f"leg{i}": hist.get(l["ticker"]) for i, l in enumerate(legs)}).dropna()
+    if frame.empty:
+        st.info("No overlapping settlement history across all selected legs.")
         return
-    if curve.empty or len(curve) < 2:
-        st.warning("Not enough live contracts to build a spread for this market.")
+
+    combo = sum(l["weight"] * frame[f"leg{i}"] for i, l in enumerate(legs))
+    range_label = st.segmented_control("Range", list(RANGE_CHOICES), default="1Y", key="b_combo_range")
+    window_days = RANGE_CHOICES.get(range_label or "1Y", 365)
+    shown = combo[combo.index >= as_of - timedelta(days=window_days)] if window_days else combo
+    if not len(shown):
+        st.info(f"No sessions inside the {range_label} window.")
         return
 
-    tickers = list(curve["ticker"])
-    expiries = dict(zip(curve["ticker"], curve["expiration"]))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=list(shown.index), y=list(shown.values), mode="lines", name="combo",
+        line=dict(color=BUILDER_COLORS[0], width=2),
+        hovertemplate="%{x|%b %d, %Y}<br>%{y:.3f}<extra></extra>",
+    ))
+    _style_axes(fig, f"Combo value ({unit_label})", None, ".2f")
+    fig.update_layout(showlegend=False, height=360)
+    st.plotly_chart(fig, width="stretch", key="builder_combo_hist",
+                    config=plotly_config("combo_spread_history"))
+    export_row(shown.rename("value").reset_index().rename(columns={"index": "date"}),
+               "combo_spread_history", key="builder_combo")
+    st.caption(f"{len(shown):,} sessions · {shown.index.min():%b %d, %Y} → {shown.index.max():%b %d, %Y}")
 
-    row2 = st.container(horizontal=True, vertical_alignment="bottom")
-    with row2:
-        # Keyed on the commodity and curve length: without that, switching market
-        # leaves a ticker from the previous curve in session state and the expiries
-        # lookup below raises KeyError. The .get guards the first render after a swap.
-        near = st.selectbox("Near leg", tickers[:-1], key=f"b_near_{code}_{n_load}",
-                            width=150, format_func=lambda t: friendly_contract(t, code))
-        _near_exp = expiries.get(near, curve["expiration"].min())
-        later = [t for t in tickers if expiries[t] > _near_exp]
-        far = st.selectbox("Far leg", later, key=f"b_far_{code}_{n_load}_{near}",
-                           width=150, format_func=lambda t: friendly_contract(t, code))
-        mode_label = st.segmented_control("Measure", ["Nominal", "% of full carry"],
-                                          default="Nominal", key="b_mode")
-        years_back = st.slider("Prior crop years", 1, BUILDER_MAX_YEARS, 4, key="b_years", width=190)
-        show_avg = st.toggle("Average", value=True, key="b_avg",
-                             help="Mean across the overlaid years at each point in the season.")
+
+def render_seasonal_pair(commodity: dict, near: str, far: str, api_key: str, as_of: date,
+                         default_rate_pct: float):
+    """The original two-leg, single-market seasonal overlay — unchanged, just re-entered
+    once the builder confirms it has exactly one market and two legs."""
+    code = commodity["product_code"]
+
+    has_archive = code in ("ZC", "ZS")
+    max_years = DEEP_SEASONAL_YEARS_BACK if has_archive else BUILDER_MAX_YEARS
 
     row3 = st.container(horizontal=True, vertical_alignment="bottom")
     with row3:
+        mode_label = st.segmented_control("Measure", ["Nominal", "% of full carry"],
+                                          default="Nominal", key="b_mode")
+        years_back = st.slider("Prior crop years", 1, max_years, min(4, max_years), key="b_years", width=190,
+                               help="Corn/soybeans reach back through the 2008+ archive." if has_archive else None)
+        show_avg = st.toggle("Average", value=True, key="b_avg",
+                             help="Mean across the overlaid years at each point in the season.")
         storage_rate = st.number_input(
             f"Daily storage ({commodity['storage_unit']})", min_value=0.0,
             value=commodity["default_storage"], step=0.00005, format="%.5f",
-            key="b_storage", width=230)
+            key="b_storage", width=210)
         annual_rate_pct = st.number_input("Annual interest rate (%)", min_value=0.0, max_value=25.0,
-                                          value=default_rate_pct, step=0.01, key="b_rate", width=190)
+                                          value=default_rate_pct, step=0.01, key="b_rate", width=180)
         window_label = st.segmented_control("Season length", ["6M", "1Y", "18M"],
                                             default="1Y", key="b_window")
-
-    if not far:
-        st.info("Pick a far leg that expires after the near leg.")
-        return
 
     annual_rate = annual_rate_pct / 100
     mode = "nominal" if (mode_label or "Nominal") == "Nominal" else "carry"
@@ -1289,8 +1440,13 @@ def render_builder(api_key: str, as_of: date, default_rate_pct: float):
     fmt = ".2f" if mode == "nominal" else ".0%"
     pair_label = f"{friendly_contract(near, code)} / {friendly_contract(far, code)}"
 
-    hist = load_seasonal_histories(near, far, code, api_key, years_back, as_of.isoformat())
-    anchor_expiry = expiries.get(near, curve["expiration"].min())
+    curve = load_curve(code, api_key, as_of.isoformat(), BUILDER_CURVE_MONTHS)
+    expiries = dict(zip(curve["ticker"], curve["expiration"]))
+    near_letter, far_letter = month_letter_of(near, code), month_letter_of(far, code)
+    hist, deep_expiries = load_deep_seasonal_histories(
+        near, far, code, api_key, years_back, expiries[near], expiries[far]
+    )
+    anchor_expiry = expiries[near]
 
     fig = go.Figure()
     by_dte: dict[str, pd.Series] = {}
@@ -1298,15 +1454,15 @@ def render_builder(api_key: str, as_of: date, default_rate_pct: float):
     skipped: list[str] = []
 
     for back in range(years_back + 1):
-        n = shift_ticker_year(near, code, -back)
-        f = shift_ticker_year(far, code, -back)
-        if not n or not f:
-            continue
+        n = deep_year_key(code, near_letter, expiries[near].year - back)
+        f = deep_year_key(code, far_letter, expiries[far].year - back)
         series, near_exp, _far_exp, s_full, i_full = build_pair_series(
-            hist, n, f, mode, storage_rate, annual_rate, commodity["multiplier"], expiries
+            hist, n, f, mode, storage_rate, annual_rate, commodity["multiplier"], deep_expiries
         )
+        display = (f"{MONTH_LETTERS[near_letter]} {expiries[near].year - back} / "
+                  f"{MONTH_LETTERS[far_letter]} {expiries[far].year - back}")
         if series is None or not len(series):
-            skipped.append(f"{n}/{f}")
+            skipped.append(display)
             continue
         if back == 0:
             storage_full, interest_full = s_full, i_full
@@ -1314,13 +1470,13 @@ def render_builder(api_key: str, as_of: date, default_rate_pct: float):
         dte = [-(near_exp - d).days for d in series.index]
         keep = [i for i, d in enumerate(dte) if d >= -window_days]
         if not keep:
-            skipped.append(f"{n}/{f}")
+            skipped.append(display)
             continue
 
         # shift every year onto the current contract's calendar so months line up
         xs = [anchor_expiry + timedelta(days=dte[i]) for i in keep]
         ys = [series.values[i] for i in keep]
-        name = f"{n} / {f}"
+        name = display
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="lines", name=name + (" (current)" if back == 0 else ""),
             line=dict(color=BUILDER_COLORS[back % len(BUILDER_COLORS)],
@@ -1395,6 +1551,109 @@ def render_builder(api_key: str, as_of: date, default_rate_pct: float):
     if skipped:
         note += f" No usable history for {', '.join(skipped)} — the feed's daily bars start 2021-09-02."
     st.caption(note)
+
+
+def render_builder(api_key: str, as_of: date, default_rate_pct: float):
+    """Spread builder: 2+ legs, each its own market and contract month.
+
+    Two legs in one market keep the full seasonal, prior-crop-year overlay below.
+    Anything else — three-plus legs, or legs from different markets — falls back to
+    a net-value readout plus the combo's own price history, since seasonal year-rolling
+    and % of full carry are only well-defined within a single calendar-spread market.
+    """
+    st.markdown("##### Build a spread")
+    st.caption(
+        "Start with a calendar spread, then use **+ Add leg** to build a butterfly, condor, "
+        "or a cross-commodity spread — each leg is its own market, contract month, and "
+        "weight. Exactly two legs in the same market keeps the seasonal, prior-year view; "
+        "anything broader shows the combo's live price history instead."
+    )
+
+    legs = render_leg_pickers(api_key, as_of)
+    if legs is None:
+        return
+
+    same_commodity = len({l["product_code"] for l in legs}) == 1
+    same_unit = len({l["commodity"]["storage_unit"] for l in legs}) == 1
+    unit_label = legs[0]["commodity"]["storage_unit"].split("/")[0] if same_unit else "mixed units"
+    net_actual = sum(l["weight"] * l["price"] for l in legs)
+
+    legs_df = pd.DataFrame({
+        "Leg": [f"Leg {i + 1}" for i in range(len(legs))],
+        "Market": [l["commodity"]["label"] for l in legs],
+        "Contract": [friendly_contract(l["ticker"], l["product_code"]) for l in legs],
+        "Weight": [l["weight"] for l in legs],
+        "Price": [l["price"] for l in legs],
+        "Contribution": [l["weight"] * l["price"] for l in legs],
+    })
+    st.dataframe(
+        legs_df.style.format({"Weight": "{:+.3f}", "Price": "{:.3f}", "Contribution": "{:+.3f}"}),
+        hide_index=True, width="stretch",
+    )
+
+    pct_full = None
+    if same_commodity and len(legs) >= 2:
+        commodity = legs[0]["commodity"]
+        rate_row = st.container(horizontal=True, vertical_alignment="bottom")
+        with rate_row:
+            storage_rate = st.number_input(
+                f"Daily storage ({commodity['storage_unit']})", min_value=0.0,
+                value=commodity["default_storage"], step=0.00005, format="%.5f",
+                key="b_combo_storage", width=210,
+            )
+            annual_rate_pct = st.number_input(
+                "Annual interest rate (%)", min_value=0.0, max_value=25.0,
+                value=default_rate_pct, step=0.01, key="b_combo_rate", width=180,
+            )
+        annual_rate = annual_rate_pct / 100
+        base = min(legs, key=lambda l: l["expiration"])
+        theo_net = 0.0
+        for l in legs:
+            if l is base:
+                theo_price = base["price"]
+            else:
+                days = (l["expiration"] - base["expiration"]).days
+                storage_full, interest_full = carry_components(
+                    base["price"], days, storage_rate, annual_rate, commodity["multiplier"]
+                )
+                theo_price = base["price"] + storage_full + interest_full
+            theo_net += l["weight"] * theo_price
+        pct_full = net_actual / theo_net if theo_net else None
+
+    metrics = st.container(horizontal=True)
+    with metrics:
+        st.metric("Net spread value", f"{net_actual:+.3f} {unit_label}", delta_color="off", border=True)
+        if pct_full is not None:
+            st.metric("% of full carry", f"{pct_full:.0%}", delta_color="off", border=True)
+
+    if not same_unit:
+        st.info(
+            "These legs are priced in different units, so the net value above is a raw "
+            "weighted sum, not a ready-made dollar spread. Set weights to do the unit "
+            "conversion yourself — see the Crush tab's 0.022 (meal) / 0.11 (oil) factors "
+            "for a worked example."
+        )
+
+    st.divider()
+    st.markdown("##### Combo price history")
+    render_combo_history(legs, unit_label, as_of, api_key)
+
+    if same_commodity and len(legs) == 2:
+        near, far = sorted(legs, key=lambda l: l["expiration"])
+        st.divider()
+        st.markdown("##### Seasonal, prior-crop-year view")
+        st.caption(
+            "Prior crop years are reconstructed by rolling the contract year back "
+            "(Nov/Jan 2026 → Nov/Jan 2025 → …), each shifted so its near leg expires on "
+            "the same calendar point, which is what lets the lines sit on one seasonal axis."
+        )
+        render_seasonal_pair(near["commodity"], near["ticker"], far["ticker"], api_key, as_of,
+                             default_rate_pct)
+    else:
+        st.caption(
+            "Seasonal year overlay and % of full carry need exactly two legs in the same "
+            "market — add/remove legs or switch every leg to one market to bring it back."
+        )
 
 
 def main():

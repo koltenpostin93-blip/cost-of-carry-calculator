@@ -44,9 +44,20 @@ funds. Editable per market.
 - `/snapshot` — live prices
 - `/aggs/{ticker}?resolution=1session` — daily settlement history
 
-Daily bars begin **2021-09-02**, which caps seasonal overlays at roughly five crop years.
+Daily bars begin **2021-09-02**, which caps seasonal overlays at roughly five crop years —
+except for corn and soybeans, bridged by a local archive (below) back to 2008.
 Massive carries no options on futures — only OPRA-listed equity/index options, which are
 a separate entitlement.
+
+### Pre-2021 archive (corn & soybeans only)
+
+`data/futures_history_archive.csv` holds daily settlements for every corn and soybean
+contract month from 2008 through 2021, ETL'd once from the JSA "Futures History.xlsx"
+workbook via `scripts/build_history_archive.py` (re-run only if that source workbook is
+updated). `history_archive.py` loads it; seasonal overlays for corn/soybeans use it to
+reach up to 18 crop years back instead of Massive's ~5, switching sources at contract
+year 2022 with no gap. Wheat, meal, and oil have no archive and stay capped at Massive's
+native window.
 
 ## Running locally
 
