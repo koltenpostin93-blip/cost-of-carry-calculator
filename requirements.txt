@@ -4,3 +4,7 @@ requests>=2.31.0
 # Pinned: newer plotly/kaleido combinations silently break PNG export on Streamlit Cloud.
 plotly>=5.18,<6
 kaleido==0.2.1
+
+# Snowflake backend for the pre-2021 history archive (USE_SNOWFLAKE=1).
+snowflake-connector-python>=3.12
+python-dotenv>=1.0

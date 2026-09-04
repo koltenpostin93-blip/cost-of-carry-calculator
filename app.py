@@ -7,11 +7,30 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from history_archive import ARCHIVE_CUTOFF_YEAR, load_price_archive
+from history_archive import ARCHIVE_CUTOFF_YEAR, archive_source, load_price_archive
 from massive_api import (MassiveApiError, get_fed_funds_rate, get_futures_curve,
                          get_settlement_histories)
 
 HERE = Path(__file__).parent
+
+# Local dev reads credentials from .env; on Streamlit Cloud there is no .env and the
+# secrets bridge below supplies the same keys.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(HERE / ".env")
+except Exception:
+    pass
+
+# Streamlit Cloud supplies secrets via st.secrets, but snowflake_db reads os.environ so
+# it stays usable from plain scripts too. Bridge once, at import, before any DB access.
+for _key in ("USE_SNOWFLAKE", "SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SNOWFLAKE_PASSWORD",
+             "SNOWFLAKE_ROLE", "SNOWFLAKE_WAREHOUSE", "SNOWFLAKE_DATABASE", "SNOWFLAKE_SCHEMA"):
+    try:
+        if _key in st.secrets and not os.environ.get(_key):
+            os.environ[_key] = str(st.secrets[_key])
+    except Exception:
+        pass  # no secrets.toml locally — .env / real env vars cover it
 
 # Swap LOGO_FILE to the 50-year anniversary asset once it's dropped into assets/.
 LOGO_FILE = "logo-50yr.png"
@@ -1550,6 +1569,10 @@ def render_seasonal_pair(commodity: dict, near: str, far: str, api_key: str, as_
     )
     if skipped:
         note += f" No usable history for {', '.join(skipped)} — the feed's daily bars start 2021-09-02."
+    if has_archive:
+        # Name the backend so a silent fallback to the committed CSV is visible.
+        src = {"snowflake": "Snowflake", "csv": "the local CSV", "none": "no archive"}
+        note += f" Pre-2022 years served from {src.get(archive_source(), archive_source())}."
     st.caption(note)
 
 

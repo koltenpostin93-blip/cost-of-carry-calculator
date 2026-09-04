@@ -51,13 +51,36 @@ a separate entitlement.
 
 ### Pre-2021 archive (corn & soybeans only)
 
-`data/futures_history_archive.csv` holds daily settlements for every corn and soybean
-contract month from 2008 through 2021, ETL'd once from the JSA "Futures History.xlsx"
-workbook via `scripts/build_history_archive.py` (re-run only if that source workbook is
-updated). `history_archive.py` loads it; seasonal overlays for corn/soybeans use it to
-reach up to 18 crop years back instead of Massive's ~5, switching sources at contract
-year 2022 with no gap. Wheat, meal, and oil have no archive and stay capped at Massive's
-native window.
+Daily settlements for every corn and soybean contract month from 2008 through 2021,
+ETL'd once from the JSA "Futures History.xlsx" workbook via
+`scripts/build_history_archive.py` (re-run only if that source workbook is updated).
+Seasonal overlays for corn/soybeans use it to reach up to 18 crop years back instead of
+Massive's ~5, switching sources at contract year 2022 with no gap. Wheat, meal, and oil
+have no archive and stay capped at Massive's native window.
+
+**Storage:** the archive lives in Snowflake at `JSA.COST_OF_CARRY.FUTURES_HISTORY_ARCHIVE`
+(49,672 rows / 168 contracts). `history_archive.py` reads it when `USE_SNOWFLAKE=1` and
+otherwise falls back to the committed `data/futures_history_archive.csv`, which holds
+identical data — so a Snowflake outage degrades rather than breaks the app. The Spread
+Builder's seasonal caption names whichever source actually served the rows.
+`snowflake/01_migrate_archive.py` creates the schema and (re-)loads it from the CSV.
+
+### Snowflake configuration
+
+Set these as Streamlit Cloud secrets (or in a local, gitignored `.env`):
+
+```toml
+USE_SNOWFLAKE       = "1"
+SNOWFLAKE_ACCOUNT   = "GNC89034.us-east-1"
+SNOWFLAKE_USER      = "KOLTENPOSTIN"
+SNOWFLAKE_PASSWORD  = "..."
+SNOWFLAKE_ROLE      = "ACCOUNTADMIN"
+SNOWFLAKE_WAREHOUSE = "COMPUTE_WH"
+SNOWFLAKE_DATABASE  = "JSA"
+SNOWFLAKE_SCHEMA    = "COST_OF_CARRY"
+```
+
+Leave `USE_SNOWFLAKE` unset to run entirely off the CSV.
 
 ## Running locally
 
